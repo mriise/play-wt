@@ -1,0 +1,39 @@
+<body>
+    <script>
+
+        window.webtransportClick = async () => {
+            let wtAddress = document.getElementById("wtAddress").value;
+            let wtCerthash = document.getElementById("wtCerthash").value;
+            let certhash = Uint8Array.from(atob(wtCerthash), c => c.charCodeAt(0));
+            let transport = new WebTransport(wtAddress, {
+                    serverCertificateHashes: [
+                    {
+                        algorithim: "sha-256",
+                        value: certhash.buffer
+                    }
+                ]
+            });
+
+            console.log(transport)
+            await transport.ready;
+    
+            // Create a bidirectional stream
+            let stream = await transport.createBidirectionalStream();
+    
+            // Send data from the client to the server
+            await stream.writable.getWriter().write(new TextEncoder().encode("ping"));
+    
+            // Read data reply from the server
+            let data = await stream.readable.getReader().read();
+            console.log(data);
+        }
+        
+    </script>
+
+    <form onsubmit="return false">
+        <input type="text" id="wtAddress" placeholder="Address" value="https://127.0.0.1:4433">
+        <input type="text" id="wtCerthash" placeholder="Certhash">
+        <button onclick="window.webtransportClick()">connect</button>
+    </form>
+    
+</body>
