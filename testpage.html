@@ -1,14 +1,23 @@
 <body>
     <script>
+        const ADDR_NAME = "wtAddress";
+        const CERTHASH_NAME = "wtCerthash";
 
-        window.webtransportClick = async () => {
-            let wtAddress = document.getElementById("wtAddress").value;
-            let wtCerthash = document.getElementById("wtCerthash").value;
+        window.onload = () => {
+            // load query param into fields
+            (new URL(window.location.href)).searchParams.forEach((k, v) => document.getElementById(v).value = k)
+        }
+
+
+        let webtransportClick = async () => {
+            let wtAddress = document.getElementById(ADDR_NAME).value;
+            let wtCerthash = document.getElementById(CERTHASH_NAME).value;
+
             let certhash = Uint8Array.from(atob(wtCerthash), c => c.charCodeAt(0));
             let transport = new WebTransport(wtAddress, {
                     serverCertificateHashes: [
                     {
-                        algorithim: "sha-256",
+                        algorithm: "sha-256",
                         value: certhash.buffer
                     }
                 ]
@@ -27,13 +36,28 @@
             let data = await stream.readable.getReader().read();
             console.log(data);
         }
+
+        let shareClick = async () => {
+            let shareURL = new URL(window.location.href);
+            shareURL.search = "";
+
+            shareURL.searchParams.append(ADDR_NAME, document.getElementById(ADDR_NAME).value);
+            shareURL.searchParams.append(CERTHASH_NAME, document.getElementById(CERTHASH_NAME).value);
+
+            navigator.clipboard.writeText(shareURL.href);
+            document.getElementById("shareButton").innerText = "copied!"
+
+            await new Promise(r => setTimeout(r, 2000));
+            document.getElementById("shareButton").innerText = "share"
+        }
         
     </script>
 
     <form onsubmit="return false">
         <input type="text" id="wtAddress" placeholder="Address" value="https://127.0.0.1:4433">
-        <input type="text" id="wtCerthash" placeholder="Certhash">
-        <button onclick="window.webtransportClick()">connect</button>
+        <input type="text" id="wtCerthash" placeholder="Certhash" style="width: 350px;">
+        <button onclick="webtransportClick()">connect</button>
+        <button onclick="shareClick()" id="shareButton">share</button>
     </form>
     
 </body>

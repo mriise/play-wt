@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use wtransport::{Certificate, Endpoint, ServerConfig};
 use data_encoding::BASE64;
 
@@ -12,6 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::builder()
         .with_bind_config(wtransport::config::IpBindConfig::LocalV4, 4433)
         .with_certificate(certificate)
+        .keep_alive_interval(Some(Duration::from_secs(3)))
         .build();
 
     let connection = Endpoint::server(config)?;
@@ -20,7 +23,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     
     loop {
-
         let connection = connection
             .accept()
             .await     // Awaits connection
@@ -42,6 +44,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // TODO: actually do ping pong with the stream
 
-        stream.map(|stream| println!("connection accepted {:?}", stream));
+        stream.map(|_| println!("connection accepted"));
     }
 }
