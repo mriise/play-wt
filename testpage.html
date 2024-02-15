@@ -28,13 +28,43 @@
     
             // Create a bidirectional stream
             let stream = await transport.createBidirectionalStream();
-    
+
+            readFromIncomingStream(stream.readable, 0);
+
+            let writer = stream.writable.getWriter();
+
+            let encoder = new TextEncoder('utf-8');
+            let rawData = "ping";
+            let data = encoder.encode(rawData);
+            await writer.write(data)
+            await writer.close();
+
             // Send data from the client to the server
-            await stream.writable.getWriter().write(new TextEncoder().encode("ping"));
+            // await stream.writable.getWriter().write(new TextEncoder().encode("ping"));
     
             // Read data reply from the server
-            let data = await stream.readable.getReader().read();
-            console.log(data);
+            // let data = await stream.readable.getReader().read();
+            // console.log(data);
+        }
+
+
+        async function readFromIncomingStream(stream, number) {
+            let decoder = new TextDecoderStream('utf-8');
+            let reader = stream.pipeThrough(decoder).getReader();
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        console.log('Stream #' + number + ' closed');
+                        return;
+                    }
+                    let data = value;
+                    console.log('Received data on stream #' + number + ': ' + data);
+                }
+            } catch (e) {
+                console.error(
+                    'Error while reading from stream #' + number + ': ' + e, 'error');
+            }
         }
 
         let shareClick = async () => {
