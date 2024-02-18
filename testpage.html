@@ -18,7 +18,7 @@
             let wtCerthash = document.getElementById(CERTHASH_NAME).value;
             let wtFileHash = document.getElementById(FILEHASH_NAME).value;
 
-            let certhash = Uint8Array.from(atob(wtCerthash), c => c.charCodeAt(0));
+            let certhash = Uint8Array.from(atob(base64URLto64(wtCerthash)), c => c.charCodeAt(0));
             let transport = new WebTransport(wtAddress, {
                 serverCertificateHashes: [
                     {
@@ -84,7 +84,7 @@
                     console.log('Received data on stream #' + number + ': ' + streamChunk);
                     let file = new Blob([streamChunk.data]);
                     console.log(file);
-                    saveBlob(file, "test.txt");
+                    saveBlob(file, streamChunk.filename);
                 }
             } catch (e) {
                 console.error(
@@ -157,7 +157,7 @@
         <input type="text" id="wtCerthash" placeholder="Certhash" style="width: 450px;">
         <label for="wtFileHash">File Hash</label>
         <input type="text" id="wtFileHash" placeholder="File Hash" style="width: 450px;">
-        <button onclick="window.webtransportClick()">connect</button>
+        <button onclick="window.webtransportClick()">fetch</button>
         <button onclick="window.shareClick()" id="shareButton">share</button>
     </form>
     

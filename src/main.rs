@@ -1,56 +1,66 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use redb::{Database, ReadableTable, TableDefinition};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Weak},
     time::Duration,
 };
 
-use cbor4ii::serde::to_vec;
-use data_encoding::{BASE64, BASE64URL, HEXUPPER};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::{select, sync::mpsc::Receiver};
+use data_encoding::BASE64URL;
+use tokio::select;
 use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
-    endpoint::{endpoint_side::Server, IncomingSession}, Certificate, Endpoint, SendStream, ServerConfig
+    endpoint::{endpoint_side::Server, IncomingSession},
+    Certificate, Endpoint, RecvStream, SendStream, ServerConfig,
 };
 
-use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, FileIdMap, NoCache};
-
+mod files;
 mod messages;
+
 use messages::{Request, Response};
 
-use crate::messages::{send_response, ErrorResponse};
+use crate::{
+    files::FileManager,
+    messages::{send_response, ErrorResponse},
+};
 
 // TODO cache filename and send along
+// TODO ser
+
+pub const FILE_DB: TableDefinition<&[u8; 32], files::FileMetaValue> =
+    TableDefinition::new(&"play-wt_files");
+
+const INTERNAL_FOLDER: &str = "wt-play_internal";
+const FILES_FOLDER: &str = "wt-play_files";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     logger();
-    let (files, _watcher, notify_receiver) = files()?;
+
+    let internal_root = build_root_folder(INTERNAL_FOLDER)?;
+    let fs_root = build_root_folder(FILES_FOLDER)?;
+
+    let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&fs_root)?;
+
+    let db_path = internal_root.join("databaseV1.db");
+    let fs_manager = FileManager::new(fs_root, db_path, fs_rx)?;
 
     let certificate = Certificate::self_signed(&["localhost", "127.0.0.1", "::1"]);
 
     info!(
         "Certhash: {}",
-        BASE64.encode(certificate.hashes()[0].as_ref())
+        BASE64URL.encode(certificate.hashes()[0].as_ref())
     );
 
-    let config = ServerConfig::builder()
-        .with_bind_config(wtransport::config::IpBindConfig::InAddrAnyDual, 41582)
-        .with_certificate(certificate)
-        .keep_alive_interval(Some(Duration::from_secs(3)))
-        .build();
-
-    let connection = Endpoint::server(config)?;
-
-    let server = WebTransportServer { ep: connection };
+    let server = WebTransportServer::new(fs_manager.db_ref(), certificate, 41582)?;
 
     select! {
         result = server.serve() => {
             error!("{:?}", result)
         }
-        result = hash_files(files, notify_receiver) => {
+        result = fs_manager.start() => {
             error!("{:?}", result)
         }
     }
@@ -59,10 +69,23 @@ async fn main() -> Result<()> {
 }
 
 pub struct WebTransportServer {
-    pub(crate) ep: Endpoint<Server>,
+    ep: Endpoint<Server>,
+    db: Arc<Database>,
 }
 
 impl WebTransportServer {
+    fn new(db: Arc<Database>, cert: Certificate, port: u16) -> Result<Self> {
+        let config = ServerConfig::builder()
+            .with_bind_config(wtransport::config::IpBindConfig::InAddrAnyDual, port)
+            .with_certificate(cert)
+            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .build();
+
+        let connection = Endpoint::server(config)?;
+
+        Ok(Self { db, ep: connection })
+    }
+
     pub async fn serve(self) -> Result<()> {
         info!(
             "Server running on https://{}",
@@ -73,7 +96,7 @@ impl WebTransportServer {
             let incoming_session = self.ep.accept().await;
 
             tokio::spawn(
-                Self::handle_incoming_session(incoming_session)
+                Self::handle_incoming_session(self.db.clone(), incoming_session)
                     .instrument(info_span!("Connection", id)),
             );
         }
@@ -81,8 +104,8 @@ impl WebTransportServer {
         Ok(())
     }
 
-    async fn handle_incoming_session(session: IncomingSession) {
-        async fn handle_inner(session: IncomingSession) -> Result<()> {
+    async fn handle_incoming_session(db_ref: Arc<Database>, session: IncomingSession) {
+        async fn handle_inner(db_ref: Arc<Database>, session: IncomingSession) -> Result<()> {
             let mut buffer = vec![0; 65536].into_boxed_slice();
             let session_request = session.await?;
 
@@ -94,46 +117,11 @@ impl WebTransportServer {
 
             let connection = session_request.accept().await?;
 
-            
             info!("Waiting for data from client...");
             loop {
                 tokio::select! {
                     stream = connection.accept_bi() => {
-                        let mut stream = stream?;
-                        info!("Accepted BI stream");
-
-                        // read bytes
-                        let bytes_read = match stream.1.read(&mut buffer).await? {
-                            Some(bytes_read) => bytes_read,
-                            None => continue,
-                        };
-
-                        
-                        // decode
-                        let decoded: Result<Request, _> = cbor4ii::serde::from_slice(&buffer[..bytes_read]);
-                        
-                        match decoded {
-                            Ok(request) => {
-                                info!("Received (bi) request '{request:?}' from client");
-
-                                let filehash_name = BASE64URL.encode(&request.hash); 
-                                let path = std::env::current_dir()?.join("wtplay-files").join("hashed").join(filehash_name);              
-                                match std::fs::read(&path) {
-                                    Ok(file) => {
-                                        info!("Responding with file {}", path.to_string_lossy());
-                                        send_response(&mut stream.0, Response::new_success(file)).await?;
-                                    },
-                                    Err(_) => {
-                                        debug!("client requested unknown hash");
-                                        send_response(&mut stream.0, ErrorResponse { status: 404 }).await?;
-                                    },
-                                }
-                            }
-                            Err(e) => {
-                                info!("client sent garbled request {:?}", e);
-                                send_response(&mut stream.0, ErrorResponse { status: 400 }).await?;
-                            }
-                        }                         
+                        signaling_stream(db_ref.clone(), stream?, &mut buffer).await?;
                     }
                     dgram = connection.receive_datagram() => {
                         let dgram = dgram?;
@@ -147,8 +135,71 @@ impl WebTransportServer {
             }
         }
 
-        info!("Session Ended: {:?}", handle_inner(session).await);
+        info!("Session Ended: {:?}", handle_inner(db_ref, session).await);
     }
+}
+
+async fn signaling_stream(
+    db_ref: Arc<Database>,
+    mut stream: (SendStream, RecvStream),
+    buffer: &mut Box<[u8]>,
+) -> Result<()> {
+    info!("Accepted BI stream");
+
+    // read bytes
+    let bytes_read = match stream.1.read(buffer).await? {
+        Some(bytes_read) => bytes_read,
+        None => return Ok(()),
+    };
+
+    // decode
+    let decoded: Result<Request, _> = cbor4ii::serde::from_slice(&buffer[..bytes_read]);
+
+    match decoded {
+        Ok(request) => {
+            info!("Received (bi) request from client");
+
+            // search db for requested file hash
+            let read_tx = db_ref.begin_read()?;
+            let table = read_tx.open_table(FILE_DB)?;
+            let record = table.get(&request.hash)?;
+
+            match record {
+                Some(record) => {
+                    let filename = record.value().1;
+                    let path = std::env::current_dir()?.join(FILES_FOLDER).join(filename);
+
+                    // TODO open uni-stream to send file data instead of signaling
+                    if let Ok(file) = std::fs::read(&path) {
+                        info!(path = String::from(path.to_string_lossy()), "Responding with file");
+                        send_response(&mut stream.0, Response::new_success(file, filename.into())).await?;
+                    } else {
+                        // TODO: test this case
+                        error!(
+                            expected_path = String::from(path.to_string_lossy()),
+                            hash = BASE64URL.encode(&request.hash),
+                            "File in database was not found in folder!"
+                        );
+                        send_response(&mut stream.0, ErrorResponse { status: 500 }).await?;
+                    }
+                }
+                None => {
+                    // hash not in db
+                    debug!(
+                        hash = BASE64URL.encode(&request.hash),
+                        "client requested unknown hash"
+                    );
+                    send_response(&mut stream.0, ErrorResponse { status: 404 }).await?;
+                }
+            };
+        }
+        Err(e) => {
+            info!("client sent garbled request {:?}", e);
+            send_response(&mut stream.0, ErrorResponse { status: 400 }).await?;
+        }
+    }
+
+    Ok(())
 }
 
 fn logger() {
@@ -163,134 +214,15 @@ fn logger() {
         .init();
 }
 
-async fn hash_files(
-    files: Vec<PathBuf>,
-    mut notify_receiver: Receiver<DebouncedEvent>,
-) -> Result<()> {
-    let mut hasher = blake3::Hasher::new();
-
-    fn hash_n_copy(hasher: &mut blake3::Hasher, path: &PathBuf) -> Result<()> {
-        hasher.update_mmap_rayon(&path)?;
-        let mut new_path = path.clone();
-        new_path.pop();
-        // TODO: use CID
-        new_path.push("hashed");
-        let hash_id = BASE64URL.encode(hasher.finalize().as_bytes());
-        new_path.push(&hash_id);
-
-        info!(
-            "adding {} to hashed files as {:?}",
-            &path.to_string_lossy(),
-            hash_id
-        );
-        fs::copy(path, new_path)?;
-
-        hasher.reset();
-        Ok(())
-    }
-    for path in files {
-        // todo: errors much?
-        let _ = hash_n_copy(&mut hasher, &path).map_err(|e| error!("{} {:?}", e, path));
-    }
-
-    loop {
-        let event = notify_receiver
-            .recv()
-            .await
-            .context("file watcher closed unexpectedly")?;
-        match event.kind {
-            // re-hash if changed or new
-            notify::EventKind::Create(ck) => match ck {
-                notify::event::CreateKind::File => debug!("file added"),
-                notify::event::CreateKind::Folder => {
-                    debug!("Folder added! TODO: zip and then hash")
-                }
-                notify::event::CreateKind::Any | notify::event::CreateKind::Other => {
-                    let _ = hash_n_copy(&mut hasher, &event.paths[0])
-                        .map_err(|e| error!("{} {:?}", e, event.paths));
-                }
-            },
-            notify::EventKind::Modify(mk) => match mk {
-                notify::event::ModifyKind::Data(_) => debug!("file modified"),
-                // any event catches too much, do nothing
-                notify::event::ModifyKind::Any => (),
-                notify::event::ModifyKind::Metadata(_)
-                | notify::event::ModifyKind::Name(_)
-                | notify::event::ModifyKind::Other => debug!("TODO modify event {:?}", event.paths),
-            },
-            // remove
-            notify::EventKind::Remove(_) => debug!("TODO file removed"),
-            // do nothing otherwise
-            notify::EventKind::Any | notify::EventKind::Access(_) | notify::EventKind::Other => (),
-        }
-    }
+fn build_root_folder(name: &str) -> Result<PathBuf> {
+    let dir = std::env::current_dir()?.join(name);
+    touch_dir(&dir);
+    Ok(dir)
 }
 
-fn files() -> Result<(
-    Vec<PathBuf>,
-    Debouncer<RecommendedWatcher, FileIdMap>,
-    Receiver<DebouncedEvent>,
-)> {
-    debug!("building folder structure");
-
-    let path = std::env::current_dir()?.join("wtplay-files");
-    touch(&path);
-    let hashed_path = path.join("hashed");
-    touch(&hashed_path);
-
-    // read & watch file
-    let files = fs::read_dir(&path)?;
-
-    //
-    let (sender, receiver) = tokio::sync::mpsc::channel::<DebouncedEvent>(12);
-
-    let mut debouncer = new_debouncer(Duration::from_secs(1), None, move |res| match res {
-        Ok(debounced) => {
-            for event in debounced {
-                let _ = sender
-                    .blocking_send(event)
-                    .map_err(|e| error!("File watcher failed to send event {:?}", e));
-            }
-        }
-        Err(e) => error!("watch error: {:?}", e),
-    })?;
-
-    info!(
-        "Watching for new files to serve in: {} ",
-        path.to_string_lossy()
-    );
-    debouncer
-        .watcher()
-        .watch(&path, RecursiveMode::NonRecursive)?;
-
-    // get all accessable files and not the hashed folder
-    let iter = files.filter_map(|file| match file {
-        Ok(file) => {
-            if file.path() != hashed_path {
-                Some(file)
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    });
-
-    let mut vec = Vec::new();
-    let mut s = String::new();
-    for file in iter {
-        vec.push(file.path());
-        s.push_str(&format!(
-            "{}, ",
-            file.file_name()
-                .to_str()
-                .context("couldnt encode file name to utf-8")?
-        ));
-    }
-
-    Ok((vec, debouncer, receiver))
-}
-
-fn touch(path: &Path) {
+/// create dir if it doesn't exist
+/// log if folder creation failed
+fn touch_dir(path: &Path) {
     match fs::read_dir(&path) {
         Ok(_) => (),
         Err(_) => {
@@ -300,15 +232,27 @@ fn touch(path: &Path) {
 }
 
 #[test]
-fn rust_js_cbor() -> Result<()>{
+fn rust_js_cbor() -> Result<()> {
+    use data_encoding::{BASE64, HEXUPPER};
     use messages::Request;
+
     let js_cbor_encoded = "uQABZGhhc2hYIJZms3GYoG16Z8x/2Z/3WM+6CR+R7RZSCiRdYN1QSpDe";
     let js_cbor = BASE64.decode(js_cbor_encoded.as_bytes())?;
 
-    let rust_cbor = Request {hash: BASE64URL.decode("cbonmWDP8UdIQ0Ff0XGPwNZlGNiH-l54Gx1nvPLvUl0=".as_bytes())?.try_into().unwrap()};
+    let rust_cbor = Request {
+        hash: BASE64URL
+            .decode("cbonmWDP8UdIQ0Ff0XGPwNZlGNiH-l54Gx1nvPLvUl0=".as_bytes())?
+            .try_into()
+            .unwrap(),
+    };
     let rust_cbor = cbor4ii::serde::to_vec(Vec::new(), &rust_cbor)?;
 
-    assert!(js_cbor == rust_cbor, "{}\n\n{}", HEXUPPER.encode(&js_cbor), HEXUPPER.encode(&rust_cbor));
+    assert!(
+        js_cbor == rust_cbor,
+        "{}\n\n{}",
+        HEXUPPER.encode(&js_cbor),
+        HEXUPPER.encode(&rust_cbor)
+    );
 
     Ok(())
 }

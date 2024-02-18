@@ -3,7 +3,7 @@ use wtransport::SendStream;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Request {
-	#[serde(with = "serde_bytes")]
+    #[serde(with = "serde_bytes")]
     pub hash: [u8; 32],
 }
 
@@ -11,8 +11,10 @@ pub struct Request {
 pub struct Response {
     pub status: u32,
     // TODO: Option instead of depending on how cbor4ii encodes and cbor-x decodes it
-	#[serde(with = "serde_bytes")]
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+
+	pub filename: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -21,8 +23,8 @@ pub struct ErrorResponse {
 }
 
 impl Response {
-    pub fn new_success(data: Vec<u8>) -> Self {
-        Self { status: 200, data }
+    pub fn new_success(data: Vec<u8>, filename: String) -> Self {
+        Self { status: 200, data, filename }
     }
 }
 
