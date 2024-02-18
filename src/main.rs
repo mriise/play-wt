@@ -12,8 +12,7 @@ use tokio::select;
 use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
-    endpoint::{endpoint_side::Server, IncomingSession},
-    Certificate, Endpoint, RecvStream, SendStream, ServerConfig,
+    endpoint::{endpoint_side::Server, IncomingSession}, Certificate, Connection, Endpoint, RecvStream, SendStream, ServerConfig
 };
 
 mod files;
@@ -116,12 +115,13 @@ impl WebTransportServer {
             );
 
             let connection = session_request.accept().await?;
+            
 
             info!("Waiting for data from client...");
             loop {
                 tokio::select! {
                     stream = connection.accept_bi() => {
-                        signaling_stream(db_ref.clone(), stream?, &mut buffer).await?;
+                        signaling_stream(db_ref.clone(), stream?, &mut buffer, &connection).await?;
                     }
                     dgram = connection.receive_datagram() => {
                         let dgram = dgram?;
@@ -143,6 +143,7 @@ async fn signaling_stream(
     db_ref: Arc<Database>,
     mut stream: (SendStream, RecvStream),
     buffer: &mut Box<[u8]>,
+    connection: &Connection,
 ) -> Result<()> {
     info!("Accepted BI stream");
 
@@ -171,8 +172,24 @@ async fn signaling_stream(
 
                     // TODO open uni-stream to send file data instead of signaling
                     if let Ok(file) = std::fs::read(&path) {
-                        info!(path = String::from(path.to_string_lossy()), "Responding with file");
-                        send_response(&mut stream.0, Response::new_success(file, filename.into())).await?;
+                        info!(
+                            path = String::from(path.to_string_lossy()),
+                            "Responding with file meta"
+                        );
+
+                        let mime = mime_guess::from_path(path);
+
+                        send_response(
+                            &mut stream.0,
+                            Response::new_success(request.hash, filename.into(), mime.first()),
+                        )
+                        .await?;
+                        
+                        let mut uni = connection.open_uni().await?.await?;
+                        debug!("Uni stream created, now sending file");
+
+                        uni.write_all(&file).await?;
+                        
                     } else {
                         // TODO: test this case
                         error!(

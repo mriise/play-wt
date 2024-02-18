@@ -35,39 +35,33 @@
             let stream = await transport.createBidirectionalStream();
 
             // readFromIncomingStream(stream.readable, 0);
-            readIncoming(stream.readable, 0);
+            readIncomingSignaling(stream.readable, 0);
+            receiveUnidirectional(transport);
 
             let writer = stream.writable.getWriter();
 
             let cbEncoder = new Encoder({ tagUint8Array: true });
-            // let data = cbEncoder.encode({
-            //     hash: new Uint8Array([0xff, 0xff])
-            // });
 
             var rawData = {
                 // needs to be array so it is encoded as array with individual unsigned so rust understands
                 hash: Uint8Array.from(atob(base64URLto64(wtFileHash)), c => c.charCodeAt(0))
             };
-            // encode as map since thats what cbor-x likes
             let data = encode(rawData);
 
             // console.log(btoa(String.fromCharCode(...new Uint8Array(data))))
             await writer.write(data)
             await writer.close();
 
-            // Send data from the client to the server
-            // await stream.writable.getWriter().write(new TextEncoder().encode("ping"));
+            // TODO close out connection when done
+            // await stream.readable.cancel();
 
-            // Read data reply from the server
-            // let data = await stream.readable.getReader().read();
-            // console.log(data);
         }
 
         function base64URLto64(data) {
             return data.replace(/_/g, '/').replace(/-/g, '+')
         }
 
-        async function readIncoming(stream, number) {
+        async function readIncomingSignaling(stream, number) {
             let d = new Decoder();
             let reader = stream.getReader();
             try {
@@ -77,18 +71,85 @@
                         console.log('Stream #' + number + ' closed');
                         return;
                     }
-                    console.log(btoa(value));
+                    // console.log(btoa(value));
                     // TODO large files dont go thru
-                    let streamChunk = Object.fromEntries(d.decode(value).entries());
-                    console.log(streamChunk);
-                    console.log('Received data on stream #' + number + ': ' + streamChunk);
-                    let file = new Blob([streamChunk.data]);
-                    console.log(file);
-                    saveBlob(file, streamChunk.filename);
+                    let cborMessage = Object.fromEntries(d.decode(value).entries());
+                    console.log(cborMessage);
+                    console.log('Received data on stream #' + number + ': ' + cborMessage);
+
+                    var opt = undefined;
+                    if (cborMessage.mime !== "") {
+                        opt = {type: cborMessage.mime};
+                    }
+
+                    if (window.downloading !== undefined) {
+                        console.error("Sorry, only one file at a time for now");
+                        return;
+                    } 
+                    window.downloading = cborMessage;
+                    
+                    // console.log(file);
+                    // saveBlob(file, cborMessage.filename);
                 }
             } catch (e) {
                 console.error(
                     'Error while reading from stream #' + number + ': ' + e, 'error');
+            }
+        }
+
+        async function receiveUnidirectional(transport) {
+            const uds = transport.incomingUnidirectionalStreams;
+            const reader = uds.getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    break;
+                }
+                // value is an instance of WebTransportReceiveStream
+                await readUni(value);
+            }
+        }
+
+        async function readUni(receiveStream) {
+            while (window.downloading === undefined) {
+                await new Promise(r => setTimeout(r, 100)); 
+            }
+            let fileInfo = window.downloading;
+            // prep file for saving
+            let filenameSplit = fileInfo.filename.split('.');
+            let ext = "." + filenameSplit.pop();
+            let filename = filenameSplit.join(".");
+            // save dialoge opt
+            const opts = {
+                excludeAcceptAllOption: true,
+                // TODO: id maybe? https://developer.mozilla.org/en-US/docs/Web/API/Window/showSaveFilePicker#id
+                // id: 1234
+                startIn: "downloads",
+                suggestedName: filename,
+                types: [
+                    {
+                        accept: { [fileInfo.mime]: [ext] },
+                    },
+                ],
+            };
+            let file = await window.showSaveFilePicker(opts);
+
+            // console.log(file, file.createWritable());
+
+            const reader = receiveStream.getReader();
+            const writer = await file.createWritable();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    // file download completed
+                    console.info("uni stream finished")
+                    writer.close()
+                    window.downloading = undefined;
+                    break;
+                }
+                // value is a Uint8Array
+                // console.log(value);
+                writer.write(value);
             }
         }
 
@@ -108,6 +169,24 @@
             // reset text
             await new Promise(r => setTimeout(r, 2000));
             document.getElementById("shareButton").innerText = oldText;
+        }
+
+        window.saveAs = async () => {
+            const opts = {
+                excludeAcceptAllOption: true,
+                // TODO: id maybe? https://developer.mozilla.org/en-US/docs/Web/API/Window/showSaveFilePicker#id
+                // id: 1234
+                startIn: "downloads",
+                suggestedName: "shit",
+                types: [
+                    {
+                        accept: { "text/plain": [".txt"] },
+                    },
+                ],
+            };
+            let file = await window.showSaveFilePicker(opts);
+
+            console.log(file, file.createWritable());
         }
 
         var saveBlob = (blob, fileName) => {
@@ -130,7 +209,7 @@
     <style>
         body {
             font-family: 'Courier New', Courier, monospace;
-        } 
+        }
 
         label {
             font-weight: bold;
@@ -147,7 +226,6 @@
             flex-direction: column;
             gap: 15px;
         }
-
     </style>
 
     <form onsubmit="return false">
@@ -160,6 +238,8 @@
         <button onclick="window.webtransportClick()">fetch</button>
         <button onclick="window.shareClick()" id="shareButton">share</button>
     </form>
-    
+
+    <button onclick="window.saveAs()">save</button>
+
     <div id="downloads" style="display: flex; flex-direction: column;"></div>
 </body>

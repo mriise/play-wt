@@ -20,3 +20,4 @@ serde = { version = "1.0", features = ["derive"] }
 cbor4ii = { version = "0.3.2", features = ["use_std", "serde1"]}
 serde_bytes = "0.11"
 redb = "1.5.0"
+mime_guess = "2.0"

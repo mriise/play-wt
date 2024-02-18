@@ -1,3 +1,4 @@
+use mime_guess::Mime;
 use serde::{Deserialize, Serialize};
 use wtransport::SendStream;
 
@@ -9,12 +10,14 @@ pub struct Request {
 
 #[derive(Serialize, Deserialize)]
 pub struct Response {
-    pub status: u32,
-    // TODO: Option instead of depending on how cbor4ii encodes and cbor-x decodes it
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
+    status: u32,
 
-	pub filename: String,
+    filename: String,
+    /// Empty String means we dont know!
+    mime: String,
+
+	#[serde(with = "serde_bytes")]
+    pub hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -23,8 +26,13 @@ pub struct ErrorResponse {
 }
 
 impl Response {
-    pub fn new_success(data: Vec<u8>, filename: String) -> Self {
-        Self { status: 200, data, filename }
+    pub fn new_success(hash: [u8; 32], filename: String, mime: Option<Mime>) -> Self {
+        Self {
+            status: 200,
+			hash,
+            filename,
+            mime: mime.map(|m| m.essence_str().into()).unwrap_or_default(),
+        }
     }
 }
 
