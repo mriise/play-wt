@@ -1,21 +1,26 @@
 <body>
-    <script>
+
+    <script type="module">
+        import { Encoder, Decoder, encode } from 'https://cdn.jsdelivr.net/npm/cbor-x@1.5.8/+esm'
+
         const ADDR_NAME = "wtAddress";
         const CERTHASH_NAME = "wtCerthash";
+        const FILEHASH_NAME = "wtFileHash";
+
 
         window.onload = () => {
             // load query param into fields
             (new URL(window.location.href)).searchParams.forEach((k, v) => document.getElementById(v).value = k)
         }
 
-
-        let webtransportClick = async () => {
+        window.webtransportClick = async () => {
             let wtAddress = document.getElementById(ADDR_NAME).value;
             let wtCerthash = document.getElementById(CERTHASH_NAME).value;
+            let wtFileHash = document.getElementById(FILEHASH_NAME).value;
 
             let certhash = Uint8Array.from(atob(wtCerthash), c => c.charCodeAt(0));
             let transport = new WebTransport(wtAddress, {
-                    serverCertificateHashes: [
+                serverCertificateHashes: [
                     {
                         algorithm: "sha-256",
                         value: certhash.buffer
@@ -25,32 +30,46 @@
 
             console.log(transport)
             await transport.ready;
-    
+
             // Create a bidirectional stream
             let stream = await transport.createBidirectionalStream();
 
-            readFromIncomingStream(stream.readable, 0);
+            // readFromIncomingStream(stream.readable, 0);
+            readIncoming(stream.readable, 0);
 
             let writer = stream.writable.getWriter();
 
-            let encoder = new TextEncoder('utf-8');
-            let rawData = "ping";
-            let data = encoder.encode(rawData);
+            let cbEncoder = new Encoder({ tagUint8Array: true });
+            // let data = cbEncoder.encode({
+            //     hash: new Uint8Array([0xff, 0xff])
+            // });
+
+            var rawData = {
+                // needs to be array so it is encoded as array with individual unsigned so rust understands
+                hash: Uint8Array.from(atob(base64URLto64(wtFileHash)), c => c.charCodeAt(0))
+            };
+            // encode as map since thats what cbor-x likes
+            let data = encode(rawData);
+
+            // console.log(btoa(String.fromCharCode(...new Uint8Array(data))))
             await writer.write(data)
             await writer.close();
 
             // Send data from the client to the server
             // await stream.writable.getWriter().write(new TextEncoder().encode("ping"));
-    
+
             // Read data reply from the server
             // let data = await stream.readable.getReader().read();
             // console.log(data);
         }
 
+        function base64URLto64(data) {
+            return data.replace(/_/g, '/').replace(/-/g, '+')
+        }
 
-        async function readFromIncomingStream(stream, number) {
-            let decoder = new TextDecoderStream('utf-8');
-            let reader = stream.pipeThrough(decoder).getReader();
+        async function readIncoming(stream, number) {
+            let d = new Decoder();
+            let reader = stream.getReader();
             try {
                 while (true) {
                     const { value, done } = await reader.read();
@@ -58,8 +77,14 @@
                         console.log('Stream #' + number + ' closed');
                         return;
                     }
-                    let data = value;
-                    console.log('Received data on stream #' + number + ': ' + data);
+                    console.log(btoa(value));
+                    // TODO large files dont go thru
+                    let streamChunk = Object.fromEntries(d.decode(value).entries());
+                    console.log(streamChunk);
+                    console.log('Received data on stream #' + number + ': ' + streamChunk);
+                    let file = new Blob([streamChunk.data]);
+                    console.log(file);
+                    saveBlob(file, "test.txt");
                 }
             } catch (e) {
                 console.error(
@@ -67,27 +92,74 @@
             }
         }
 
-        let shareClick = async () => {
+        window.shareClick = async () => {
             let shareURL = new URL(window.location.href);
             shareURL.search = "";
 
             shareURL.searchParams.append(ADDR_NAME, document.getElementById(ADDR_NAME).value);
             shareURL.searchParams.append(CERTHASH_NAME, document.getElementById(CERTHASH_NAME).value);
+            shareURL.searchParams.append(FILEHASH_NAME, document.getElementById(FILEHASH_NAME).value);
 
+            // copy to clipboard
             navigator.clipboard.writeText(shareURL.href);
+            let oldText = document.getElementById("shareButton").innerText;
             document.getElementById("shareButton").innerText = "copied!"
 
+            // reset text
             await new Promise(r => setTimeout(r, 2000));
-            document.getElementById("shareButton").innerText = "share"
+            document.getElementById("shareButton").innerText = oldText;
         }
-        
+
+        var saveBlob = (blob, fileName) => {
+            var a = document.createElement("a");
+            document.getElementById("downloads").appendChild(a);
+            a.innerText = "Download: " + fileName
+            a.style.padding = "5px";
+
+            const url = window.URL.createObjectURL(blob);
+            a.href = url;
+            a.download = fileName;
+            // dont auto download
+            // a.click();
+            // a.remove()
+            // window.URL.revokeObjectURL(url);
+        };
+
     </script>
 
+    <style>
+        body {
+            font-family: 'Courier New', Courier, monospace;
+        } 
+
+        label {
+            font-weight: bold;
+            font-size: large;
+        }
+
+        form button {
+            width: 200px;
+            font-size: medium;
+        }
+
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+    </style>
+
     <form onsubmit="return false">
+        <label for="wtAddress">Address and Port</label>
         <input type="text" id="wtAddress" placeholder="Address" value="https://127.0.0.1:4433">
-        <input type="text" id="wtCerthash" placeholder="Certhash" style="width: 350px;">
-        <button onclick="webtransportClick()">connect</button>
-        <button onclick="shareClick()" id="shareButton">share</button>
+        <label for="wtCerthash">Certhash</label>
+        <input type="text" id="wtCerthash" placeholder="Certhash" style="width: 450px;">
+        <label for="wtFileHash">File Hash</label>
+        <input type="text" id="wtFileHash" placeholder="File Hash" style="width: 450px;">
+        <button onclick="window.webtransportClick()">connect</button>
+        <button onclick="window.shareClick()" id="shareButton">share</button>
     </form>
     
+    <div id="downloads" style="display: flex; flex-direction: column;"></div>
 </body>

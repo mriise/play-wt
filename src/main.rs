@@ -5,17 +5,24 @@ use std::{
     time::Duration,
 };
 
-use data_encoding::{BASE64, BASE64URL};
+use cbor4ii::serde::to_vec;
+use data_encoding::{BASE64, BASE64URL, HEXUPPER};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{select, sync::mpsc::Receiver};
 use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
-    endpoint::{endpoint_side::Server, IncomingSession},
-    Certificate, Endpoint, ServerConfig,
+    endpoint::{endpoint_side::Server, IncomingSession}, Certificate, Endpoint, SendStream, ServerConfig
 };
 
 use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, FileIdMap, NoCache};
+
+mod messages;
+use messages::{Request, Response};
+
+use crate::messages::{send_response, ErrorResponse};
+
+// TODO cache filename and send along
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,6 +94,7 @@ impl WebTransportServer {
 
             let connection = session_request.accept().await?;
 
+            
             info!("Waiting for data from client...");
             loop {
                 tokio::select! {
@@ -94,16 +102,38 @@ impl WebTransportServer {
                         let mut stream = stream?;
                         info!("Accepted BI stream");
 
+                        // read bytes
                         let bytes_read = match stream.1.read(&mut buffer).await? {
                             Some(bytes_read) => bytes_read,
                             None => continue,
                         };
 
-                        let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
+                        
+                        // decode
+                        let decoded: Result<Request, _> = cbor4ii::serde::from_slice(&buffer[..bytes_read]);
+                        
+                        match decoded {
+                            Ok(request) => {
+                                info!("Received (bi) request '{request:?}' from client");
 
-                        info!("Received (bi) '{str_data}' from client");
-
-                        stream.0.write_all(b"ACK").await?;
+                                let filehash_name = BASE64URL.encode(&request.hash); 
+                                let path = std::env::current_dir()?.join("wtplay-files").join("hashed").join(filehash_name);              
+                                match std::fs::read(&path) {
+                                    Ok(file) => {
+                                        info!("Responding with file {}", path.to_string_lossy());
+                                        send_response(&mut stream.0, Response::new_success(file)).await?;
+                                    },
+                                    Err(_) => {
+                                        debug!("client requested unknown hash");
+                                        send_response(&mut stream.0, ErrorResponse { status: 404 }).await?;
+                                    },
+                                }
+                            }
+                            Err(e) => {
+                                info!("client sent garbled request {:?}", e);
+                                send_response(&mut stream.0, ErrorResponse { status: 400 }).await?;
+                            }
+                        }                         
                     }
                     dgram = connection.receive_datagram() => {
                         let dgram = dgram?;
@@ -123,7 +153,7 @@ impl WebTransportServer {
 
 fn logger() {
     let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::DEBUG.into())
+        .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
 
     tracing_subscriber::fmt()
@@ -133,7 +163,10 @@ fn logger() {
         .init();
 }
 
-async fn hash_files(files: Vec<PathBuf>, mut notify_receiver: Receiver<DebouncedEvent>) -> Result<()> {
+async fn hash_files(
+    files: Vec<PathBuf>,
+    mut notify_receiver: Receiver<DebouncedEvent>,
+) -> Result<()> {
     let mut hasher = blake3::Hasher::new();
 
     fn hash_n_copy(hasher: &mut blake3::Hasher, path: &PathBuf) -> Result<()> {
@@ -157,7 +190,7 @@ async fn hash_files(files: Vec<PathBuf>, mut notify_receiver: Receiver<Debounced
     }
     for path in files {
         // todo: errors much?
-        hash_n_copy(&mut hasher, &path);
+        let _ = hash_n_copy(&mut hasher, &path).map_err(|e| error!("{} {:?}", e, path));
     }
 
     loop {
@@ -173,14 +206,15 @@ async fn hash_files(files: Vec<PathBuf>, mut notify_receiver: Receiver<Debounced
                     debug!("Folder added! TODO: zip and then hash")
                 }
                 notify::event::CreateKind::Any | notify::event::CreateKind::Other => {
-                    hash_n_copy(&mut hasher, &event.paths[0]).map_err(|e| error!("{} {:?}", e, event.paths));
+                    let _ = hash_n_copy(&mut hasher, &event.paths[0])
+                        .map_err(|e| error!("{} {:?}", e, event.paths));
                 }
             },
             notify::EventKind::Modify(mk) => match mk {
                 notify::event::ModifyKind::Data(_) => debug!("file modified"),
                 // any event catches too much, do nothing
                 notify::event::ModifyKind::Any => (),
-                | notify::event::ModifyKind::Metadata(_)
+                notify::event::ModifyKind::Metadata(_)
                 | notify::event::ModifyKind::Name(_)
                 | notify::event::ModifyKind::Other => debug!("TODO modify event {:?}", event.paths),
             },
@@ -192,7 +226,11 @@ async fn hash_files(files: Vec<PathBuf>, mut notify_receiver: Receiver<Debounced
     }
 }
 
-fn files() -> Result<(Vec<PathBuf>, Debouncer<RecommendedWatcher, FileIdMap>, Receiver<DebouncedEvent>)> {
+fn files() -> Result<(
+    Vec<PathBuf>,
+    Debouncer<RecommendedWatcher, FileIdMap>,
+    Receiver<DebouncedEvent>,
+)> {
     debug!("building folder structure");
 
     let path = std::env::current_dir()?.join("wtplay-files");
@@ -210,20 +248,20 @@ fn files() -> Result<(Vec<PathBuf>, Debouncer<RecommendedWatcher, FileIdMap>, Re
         Ok(debounced) => {
             for event in debounced {
                 let _ = sender
-                .blocking_send(event)
-                .map_err(|e| error!("File watcher failed to send event {:?}", e));
+                    .blocking_send(event)
+                    .map_err(|e| error!("File watcher failed to send event {:?}", e));
             }
-
         }
         Err(e) => error!("watch error: {:?}", e),
     })?;
-
 
     info!(
         "Watching for new files to serve in: {} ",
         path.to_string_lossy()
     );
-    debouncer.watcher().watch(&path, RecursiveMode::NonRecursive)?;
+    debouncer
+        .watcher()
+        .watch(&path, RecursiveMode::NonRecursive)?;
 
     // get all accessable files and not the hashed folder
     let iter = files.filter_map(|file| match file {
@@ -259,4 +297,18 @@ fn touch(path: &Path) {
             let _ = fs::create_dir(&path).map_err(|e| error!("{e}"));
         }
     }
+}
+
+#[test]
+fn rust_js_cbor() -> Result<()>{
+    use messages::Request;
+    let js_cbor_encoded = "uQABZGhhc2hYIJZms3GYoG16Z8x/2Z/3WM+6CR+R7RZSCiRdYN1QSpDe";
+    let js_cbor = BASE64.decode(js_cbor_encoded.as_bytes())?;
+
+    let rust_cbor = Request {hash: BASE64URL.decode("cbonmWDP8UdIQ0Ff0XGPwNZlGNiH-l54Gx1nvPLvUl0=".as_bytes())?.try_into().unwrap()};
+    let rust_cbor = cbor4ii::serde::to_vec(Vec::new(), &rust_cbor)?;
+
+    assert!(js_cbor == rust_cbor, "{}\n\n{}", HEXUPPER.encode(&js_cbor), HEXUPPER.encode(&rust_cbor));
+
+    Ok(())
 }
