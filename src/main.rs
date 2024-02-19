@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         BASE64URL.encode(certificate.hashes()[0].as_ref())
     );
 
-    let port = 47681;
+    let port = 4999;
     let server = WebTransportServer::new(fs_manager.db_ref(), certificate, port)?;
 
     select! {
@@ -69,18 +69,25 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
     // 2 weeks
     const WEEK_DUR: u32 = 60 * 60 * 24 * 14;
     fn inner(local_addr: SocketAddr) -> Result<()> {
+        use local_ip_address::{local_ip, local_ipv6};
         use igd_next::*;
+
+        // OS gave us an ipv6 for webtransport, get our global address and print a link
+        if local_addr.is_ipv6() {
+            info!("External IPv6 Address: https://[{}]:{}", local_ipv6()?, local_addr.port())
+        }
+
+        // Attempt to add portsesu to UPnP, just in case client can only use ip4 
         info!("Getting gateway");
 
-        let mut opt = SearchOptions::default();
-        // opt.bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 0);
-        let gw = search_gateway(opt)?;
+        let gw = search_gateway(SearchOptions::default())?;
 
-        info!("Adding port");
-        let p_port = gw.add_any_port(PortMappingProtocol::UDP, local_addr, 0, "play-wt")?;
-        info!("Added public port {}", p_port);
-        
-        // gw.add_port(PortMappingProtocol::UDP, port, local_socket, WEEK_DUR, "play-wt")?;
+        // local ip4 (just incase our wt ip is v6)
+        let local_ip4 = SocketAddr::new(local_ip()?, local_addr.port());
+
+        debug!("Adding UPnP port with ip4 {}", local_ip4);
+        let p_port = gw.add_port(PortMappingProtocol::UDP, local_addr.port(), local_ip4, WEEK_DUR, "play-wt")?;
+        info!("External Address: https://{}:{}", gw.get_external_ip()?, local_addr.port());
 
         Ok(())
     }
@@ -108,12 +115,7 @@ impl WebTransportServer {
     }
 
     pub async fn serve(self) -> Result<()> {
-        info!("{:?}", upnp(self.ep.local_addr()?).await);
-
-        info!(
-            "Server running on https://{}",
-            self.ep.local_addr().unwrap()
-        );
+        let _ = upnp(self.ep.local_addr()?).await.map_err(|e| error!("{e}"));
 
         for id in 0.. {
             let incoming_session = self.ep.accept().await;
@@ -241,6 +243,14 @@ async fn signaling_stream(
     }
 
     Ok(())
+}
+
+impl Drop for WebTransportServer {
+    fn drop(&mut self) {
+        let port = self.ep.local_addr().expect("Server should already have an ip on program exit").port();
+        let gw = igd_next::search_gateway(Default::default()).expect("gateway not found, cant remove port on close");
+        info!("{:?}", gw.remove_port(igd_next::PortMappingProtocol::UDP, port));
+    }
 }
 
 fn logger() {
