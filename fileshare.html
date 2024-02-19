@@ -111,6 +111,7 @@
         }
 
         async function readUni(receiveStream) {
+            // the fact we even have to do this...
             while (window.downloading === undefined) {
                 await new Promise(r => setTimeout(r, 100)); 
             }
@@ -132,6 +133,7 @@
                     },
                 ],
             };
+            // TODO try/catch and clear the stupid
             let file = await window.showSaveFilePicker(opts);
 
             // console.log(file, file.createWritable());
@@ -142,8 +144,8 @@
                 const { done, value } = await reader.read();
                 if (done) {
                     // file download completed
-                    console.info("uni stream finished")
-                    writer.close()
+                    console.info("uni stream finished");
+                    writer.close();
                     window.downloading = undefined;
                     break;
                 }
@@ -164,35 +166,17 @@
             // copy to clipboard
             navigator.clipboard.writeText(shareURL.href);
             let oldText = document.getElementById("shareButton").innerText;
-            document.getElementById("shareButton").innerText = "copied!"
+            document.getElementById("shareButton").innerText = "copied!";
 
             // reset text
             await new Promise(r => setTimeout(r, 2000));
             document.getElementById("shareButton").innerText = oldText;
         }
 
-        window.saveAs = async () => {
-            const opts = {
-                excludeAcceptAllOption: true,
-                // TODO: id maybe? https://developer.mozilla.org/en-US/docs/Web/API/Window/showSaveFilePicker#id
-                // id: 1234
-                startIn: "downloads",
-                suggestedName: "shit",
-                types: [
-                    {
-                        accept: { "text/plain": [".txt"] },
-                    },
-                ],
-            };
-            let file = await window.showSaveFilePicker(opts);
-
-            console.log(file, file.createWritable());
-        }
-
         var saveBlob = (blob, fileName) => {
             var a = document.createElement("a");
             document.getElementById("downloads").appendChild(a);
-            a.innerText = "Download: " + fileName
+            a.innerText = "Download: " + fileName;
             a.style.padding = "5px";
 
             const url = window.URL.createObjectURL(blob);
@@ -238,8 +222,6 @@
         <button onclick="window.webtransportClick()">fetch</button>
         <button onclick="window.shareClick()" id="shareButton">share</button>
     </form>
-
-    <button onclick="window.saveAs()">save</button>
 
     <div id="downloads" style="display: flex; flex-direction: column;"></div>
 </body>

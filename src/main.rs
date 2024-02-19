@@ -1,10 +1,7 @@
 use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Weak},
-    time::Duration,
+    fs, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, sync::{Arc, Weak}, time::Duration
 };
 
 use data_encoding::BASE64URL;
@@ -53,7 +50,8 @@ async fn main() -> Result<()> {
         BASE64URL.encode(certificate.hashes()[0].as_ref())
     );
 
-    let server = WebTransportServer::new(fs_manager.db_ref(), certificate, 41582)?;
+    let port = 47681;
+    let server = WebTransportServer::new(fs_manager.db_ref(), certificate, port)?;
 
     select! {
         result = server.serve() => {
@@ -63,6 +61,30 @@ async fn main() -> Result<()> {
             error!("{:?}", result)
         }
     }
+
+    Ok(())
+}
+
+async fn upnp(local_addr: SocketAddr) -> Result<()> {
+    // 2 weeks
+    const WEEK_DUR: u32 = 60 * 60 * 24 * 14;
+    fn inner(local_addr: SocketAddr) -> Result<()> {
+        use igd_next::*;
+        info!("Getting gateway");
+
+        let mut opt = SearchOptions::default();
+        // opt.bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 0);
+        let gw = search_gateway(opt)?;
+
+        info!("Adding port");
+        let p_port = gw.add_any_port(PortMappingProtocol::UDP, local_addr, 0, "play-wt")?;
+        info!("Added public port {}", p_port);
+        
+        // gw.add_port(PortMappingProtocol::UDP, port, local_socket, WEEK_DUR, "play-wt")?;
+
+        Ok(())
+    }
+    let _ = inner(local_addr).map_err(|e| error!("{e}"));
 
     Ok(())
 }
@@ -86,6 +108,8 @@ impl WebTransportServer {
     }
 
     pub async fn serve(self) -> Result<()> {
+        info!("{:?}", upnp(self.ep.local_addr()?).await);
+
         info!(
             "Server running on https://{}",
             self.ep.local_addr().unwrap()
