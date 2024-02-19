@@ -1,4 +1,5 @@
 use std::{
+    io::{self, Write},
     path::{self, Path},
     sync::Arc,
     time::Duration,
@@ -46,6 +47,8 @@ impl FileManager {
         let db_write = db.begin_write()?;
         {
             let _fs_table = db_write.open_table(crate::FILE_DB)?;
+
+            info!("{:?}", db_write.stats()?);
         }
         db_write.commit()?;
 
@@ -165,11 +168,7 @@ impl FileManager {
             return Ok(());
         }
 
-        let hash = {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update_mmap_rayon(&path)?;
-            hasher.finalize()
-        };
+        let hash = { blake3::hash(&std::fs::read(&path)?) };
 
         let name = path_to_filename(path)?;
 

@@ -1,16 +1,27 @@
 <body>
+    <!-- <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4/dist/blake3.umd.min.js"></script> -->
 
     <script type="module">
         import { Encoder, Decoder, encode } from 'https://cdn.jsdelivr.net/npm/cbor-x@1.5.8/+esm'
+        import {createBLAKE3} from 'https://cdn.jsdelivr.net/npm/hash-wasm@4/dist/blake3.umd.min.js/+esm'
+        
 
         const ADDR_NAME = "wtAddress";
         const CERTHASH_NAME = "wtCerthash";
         const FILEHASH_NAME = "wtFileHash";
 
 
-        window.onload = () => {
+        window.onload = async () => {
             // load query param into fields
-            (new URL(window.location.href)).searchParams.forEach((k, v) => document.getElementById(v).value = k)
+            (new URL(window.location.href)).searchParams.forEach((k, v) => document.getElementById(v).value = k);
+            setupMessageQueues();
+
+            // NOTE: only one instance of blake3 so only one file to verify at a time
+            window.BLAKE3 = await createBLAKE3();
+        }
+
+        function setupMessageQueues() {
+            window.downloading = new Array();
         }
 
         window.webtransportClick = async () => {
@@ -19,16 +30,26 @@
             let wtFileHash = document.getElementById(FILEHASH_NAME).value;
 
             let certhash = Uint8Array.from(atob(base64URLto64(wtCerthash)), c => c.charCodeAt(0));
-            let transport = new WebTransport(wtAddress, {
-                serverCertificateHashes: [
-                    {
-                        algorithm: "sha-256",
-                        value: certhash.buffer
-                    }
-                ]
-            });
 
-            console.log(transport)
+            // dont start a new connection if we already have one
+            // TODO: quick swapping of servers? this assumes only one connection
+            let transport;
+            if (window.transport !== undefined) {
+                transport = window.transport;
+            } else {
+                transport = new WebTransport(wtAddress, {
+                    serverCertificateHashes: [
+                        {
+                            algorithm: "sha-256",
+                            value: certhash.buffer
+                        }
+                    ]
+                });
+                window.transport = transport;
+            }
+            
+
+            // console.log(transport)
             await transport.ready;
 
             // Create a bidirectional stream
@@ -49,7 +70,7 @@
             let data = encode(rawData);
 
             // console.log(btoa(String.fromCharCode(...new Uint8Array(data))))
-            await writer.write(data)
+            await writer.write(data);
             await writer.close();
 
             // TODO close out connection when done
@@ -60,34 +81,46 @@
         function base64URLto64(data) {
             return data.replace(/_/g, '/').replace(/-/g, '+')
         }
+        function base64to64URL(data) {
+            return data.replace(/\//g, '_').replace(/\+/g, '-')
+        }
+        /// Base64URL encode Uint8Array bytes 
+        function base64URLencode(hash) {
+            return base64to64URL(btoa(String.fromCharCode(...hash)))
+        }
 
         async function readIncomingSignaling(stream, number) {
             let d = new Decoder();
             let reader = stream.getReader();
             try {
+                let chunks = new Array();
                 while (true) {
                     const { value, done } = await reader.read();
                     if (done) {
                         console.log('Stream #' + number + ' closed');
+                        let joined = joinChunks(chunks);
+                        // console.log(btoa(value));
+                        let cborMessage = Object.fromEntries(d.decode(joined).entries());
+                        console.log(cborMessage);
+                        switch (cborMessage.status) {
+                            case 200: {
+                                window.downloading.push(cborMessage);
+                                fileDownloadProgress(cborMessage.hash, cborMessage.filename);
+                                break;
+                            }
+                            case 500: {
+                                console.error("Invalid message, likely an internal error")
+                                break;
+                            }
+                            case 404: {
+                                console.info("File not found on server")
+                                break;
+                            }
+                        }
                         return;
                     }
-                    // console.log(btoa(value));
-                    // TODO large files dont go thru
-                    let cborMessage = Object.fromEntries(d.decode(value).entries());
-                    console.log(cborMessage);
-                    console.log('Received data on stream #' + number + ': ' + cborMessage);
-
-                    var opt = undefined;
-                    if (cborMessage.mime !== "") {
-                        opt = {type: cborMessage.mime};
-                    }
-
-                    if (window.downloading !== undefined) {
-                        console.error("Sorry, only one file at a time for now");
-                        return;
-                    } 
-                    window.downloading = cborMessage;
                     
+                    chunks.push(value);
                     // console.log(file);
                     // saveBlob(file, cborMessage.filename);
                 }
@@ -97,12 +130,33 @@
             }
         }
 
+        // https://stackoverflow.com/a/49129872
+        function joinChunks(chunks) {
+            // Get the total length of all arrays.
+            let length = 0;
+            chunks.forEach(item => {
+                length += item.length;
+            });
+
+            // Create a new array with total length and merge all source arrays.
+            let mergedArray = new Uint8Array(length);
+            let offset = 0;
+            chunks.forEach(item => {
+                mergedArray.set(item, offset);
+                offset += item.length;
+            });
+
+            return mergedArray;
+        }
+
+        /// Top level Stream of streams for accepting Uni
         async function receiveUnidirectional(transport) {
             const uds = transport.incomingUnidirectionalStreams;
             const reader = uds.getReader();
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
+                    await reader.close();
                     break;
                 }
                 // value is an instance of WebTransportReceiveStream
@@ -110,12 +164,14 @@
             }
         }
 
+        /// Accept individual Uni stream
         async function readUni(receiveStream) {
             // the fact we even have to do this...
-            while (window.downloading === undefined) {
+            while (window.downloading.at(0) === undefined) {
+                console.log(window.downloading)
                 await new Promise(r => setTimeout(r, 100)); 
             }
-            let fileInfo = window.downloading;
+            let fileInfo = window.downloading.shift();
             // prep file for saving
             let filenameSplit = fileInfo.filename.split('.');
             let ext = "." + filenameSplit.pop();
@@ -135,23 +191,42 @@
             };
             // TODO try/catch and clear the stupid
             let file = await window.showSaveFilePicker(opts);
+            let chosenFileName = (await file.getFile()).name;
+
+            let hashText = base64URLencode(fileInfo.hash);
+            console.info("Saving " + hashText + ' to file "' + chosenFileName + '"');
 
             // console.log(file, file.createWritable());
 
             const reader = receiveStream.getReader();
             const writer = await file.createWritable();
+            window.BLAKE3.init();
+            var totalWritten = 0;
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
                     // file download completed
                     console.info("uni stream finished");
                     writer.close();
-                    window.downloading = undefined;
+                    let computedHash = window.BLAKE3.digest('binary');
+                    console.debug(computedHash, fileInfo.hash);
+                    // I REALLY hate js, why is this the BEST way to see if two byte arrays are equal???
+                    if (Object.is(computedHash, fileInfo.hash)) {
+                        // TODO: not this filename, the one the user made
+                        alert(fileInfo.filename + " failed verification. DO NOT TRUST")
+                    }
+                    // update UI
+                    updateDownloadProgress(hashText, 100)
                     break;
                 }
                 // value is a Uint8Array
                 // console.log(value);
+                window.BLAKE3.update(value);
                 writer.write(value);
+
+                // update UI
+                totalWritten += value.length;
+                updateDownloadProgress(hashText, Math.floor((totalWritten/fileInfo.size)*100))
             }
         }
 
@@ -188,6 +263,45 @@
             // window.URL.revokeObjectURL(url);
         };
 
+        function fileDownloadProgress(hash, fileName) {
+            let hashText = base64URLencode(hash);
+
+            var div = document.createElement("div");;
+            div.id = hashText;
+            div.classList.add("file")
+
+            var span = document.createElement("span");
+
+            var fileNameA = document.createElement("a");
+            fileNameA.innerText = fileName;
+            // TODO onclick
+            var hashTextDiv = document.createElement("div");
+            hashTextDiv.innerText = hashText;
+
+            span.appendChild(fileNameA);
+            span.appendChild(hashTextDiv);
+            div.appendChild(span);
+
+            var bar = document.createElement("div");
+            bar.classList.add("progressBar")
+            
+            var barInner = document.createElement("div");
+            barInner.id = hashText + "-bar";
+            barInner.classList.add("progressBarInner")
+            bar.appendChild(barInner);
+            div.appendChild(bar);
+
+
+            document.getElementById("downloads").appendChild(div);
+        }
+
+        // 
+        function updateDownloadProgress(hashText, percentDone) {
+            let bar = document.getElementById(hashText + '-bar');
+            // console.log(hashText, percentDone + '%');
+            bar.style.width = percentDone + '%';
+        }
+
     </script>
 
     <style>
@@ -210,6 +324,53 @@
             flex-direction: column;
             gap: 15px;
         }
+
+        #downloads {
+            gap: 16px;
+        }
+
+        .file {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            padding: 10px;
+            width: 80%;
+            background-color: rgb(237, 237, 237);
+        }
+
+        .progressBar {
+            width: 100%;
+            height: 5px;
+            border: 1px solid gray;
+            border-radius: 3px;
+        }
+
+        .progressBarInner {
+            width: 1%;
+            height: 5px;
+            background-color: #1cf28c;
+            border-radius: 3px;
+        }
+
+        .file span {
+            gap: 16px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .file a {
+            font-family: Verdana, Geneva, Tahoma, sans-serif;
+            font-weight: bold;
+            font-size: large;
+        }
+        .file span div {
+            font-size: small;
+            padding: 2px;
+            border: 1px solid chocolate;
+            border-radius: 3px;
+            color: chocolate;
+            width: fit-content;
+        }
     </style>
 
     <form onsubmit="return false">
@@ -223,5 +384,7 @@
         <button onclick="window.shareClick()" id="shareButton">share</button>
     </form>
 
-    <div id="downloads" style="display: flex; flex-direction: column;"></div>
+    <div id="downloads" style="display: flex; flex-direction: column;">
+        
+    </div>
 </body>

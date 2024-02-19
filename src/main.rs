@@ -1,15 +1,20 @@
 use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::{
-    fs, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, sync::{Arc, Weak}, time::Duration
+    fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+    time::Duration,
 };
 
 use data_encoding::BASE64URL;
 use tokio::select;
-use tracing::{debug, error, info, info_span, Instrument};
+use tracing::{debug, error, error_span, info, info_span, Instrument};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
-    endpoint::{endpoint_side::Server, IncomingSession}, Certificate, Connection, Endpoint, RecvStream, SendStream, ServerConfig
+    endpoint::{endpoint_side::Server, IncomingSession},
+    Certificate, Connection, Endpoint, RecvStream, SendStream, ServerConfig,
 };
 
 mod files;
@@ -22,8 +27,7 @@ use crate::{
     messages::{send_response, ErrorResponse},
 };
 
-// TODO cache filename and send along
-// TODO ser
+// TODO: DB eats up more space than it seemingly needs. maybe switch to sqlite3?
 
 pub const FILE_DB: TableDefinition<&[u8; 32], files::FileMetaValue> =
     TableDefinition::new(&"play-wt_files");
@@ -45,10 +49,7 @@ async fn main() -> Result<()> {
 
     let certificate = Certificate::self_signed(&["localhost", "127.0.0.1", "::1"]);
 
-    info!(
-        "Certhash: {}",
-        BASE64URL.encode(certificate.hashes()[0].as_ref())
-    );
+    info!(certhash = BASE64URL.encode(certificate.hashes()[0].as_ref()),);
 
     let port = 4999;
     let server = WebTransportServer::new(fs_manager.db_ref(), certificate, port)?;
@@ -66,32 +67,49 @@ async fn main() -> Result<()> {
 }
 
 async fn upnp(local_addr: SocketAddr) -> Result<()> {
-    // 2 weeks
+    // 2 weeks (our TLS cert expires then as well)
     const WEEK_DUR: u32 = 60 * 60 * 24 * 14;
     fn inner(local_addr: SocketAddr) -> Result<()> {
-        use local_ip_address::{local_ip, local_ipv6};
         use igd_next::*;
+        use local_ip_address::{local_ip, local_ipv6};
 
         // OS gave us an ipv6 for webtransport, get our global address and print a link
         if local_addr.is_ipv6() {
-            info!("External IPv6 Address: https://[{}]:{}", local_ipv6()?, local_addr.port())
+            info!(
+                "External IPv6 Address: https://[{}]:{}",
+                local_ipv6()?,
+                local_addr.port()
+            )
         }
 
-        // Attempt to add portsesu to UPnP, just in case client can only use ip4 
-        info!("Getting gateway");
+        // Attempt to add portsesu to UPnP, just in case client can only use ip4
+        info!("Asking Default Gateway for UPnP port");
 
         let gw = search_gateway(SearchOptions::default())?;
 
-        // local ip4 (just incase our wt ip is v6)
+        // local ip4 (just incase our webtransport ip is v6)
         let local_ip4 = SocketAddr::new(local_ip()?, local_addr.port());
 
         debug!("Adding UPnP port with ip4 {}", local_ip4);
-        let p_port = gw.add_port(PortMappingProtocol::UDP, local_addr.port(), local_ip4, WEEK_DUR, "play-wt")?;
-        info!("External Address: https://{}:{}", gw.get_external_ip()?, local_addr.port());
+        gw.add_port(
+            PortMappingProtocol::UDP,
+            local_addr.port(),
+            local_ip4,
+            WEEK_DUR,
+            "play-wt",
+        )?;
+        info!(
+            "External Address: https://{}:{}",
+            gw.get_external_ip()?,
+            local_addr.port()
+        );
 
         Ok(())
     }
+    let span = error_span!("Net Startup");
+    let _enter = span.enter();
     let _ = inner(local_addr).map_err(|e| error!("{e}"));
+    info!("Finished!");
 
     Ok(())
 }
@@ -141,7 +159,6 @@ impl WebTransportServer {
             );
 
             let connection = session_request.accept().await?;
-            
 
             info!("Waiting for data from client...");
             loop {
@@ -149,14 +166,14 @@ impl WebTransportServer {
                     stream = connection.accept_bi() => {
                         signaling_stream(db_ref.clone(), stream?, &mut buffer, &connection).await?;
                     }
-                    dgram = connection.receive_datagram() => {
-                        let dgram = dgram?;
-                        let str_data = std::str::from_utf8(&dgram)?;
+                    // dgram = connection.receive_datagram() => {
+                    //     let dgram = dgram?;
+                    //     let str_data = std::str::from_utf8(&dgram)?;
 
-                        info!("Received (dgram) '{str_data}' from client");
+                    //     info!("Received (dgram) '{str_data}' from client");
 
-                        connection.send_datagram(b"ACK")?;
-                    }
+                    //     connection.send_datagram(b"ACK")?;
+                    // }
                 }
             }
         }
@@ -193,10 +210,9 @@ async fn signaling_stream(
 
             match record {
                 Some(record) => {
-                    let filename = record.value().1;
+                    let (size, filename) = record.value();
                     let path = std::env::current_dir()?.join(FILES_FOLDER).join(filename);
 
-                    // TODO open uni-stream to send file data instead of signaling
                     if let Ok(file) = std::fs::read(&path) {
                         info!(
                             path = String::from(path.to_string_lossy()),
@@ -207,15 +223,20 @@ async fn signaling_stream(
 
                         send_response(
                             &mut stream.0,
-                            Response::new_success(request.hash, filename.into(), mime.first()),
+                            Response::new_success(
+                                request.hash,
+                                filename.into(),
+                                mime.first(),
+                                size,
+                            ),
                         )
                         .await?;
-                        
+                        stream.0.finish().await?;
+
                         let mut uni = connection.open_uni().await?.await?;
                         debug!("Uni stream created, now sending file");
 
                         uni.write_all(&file).await?;
-                        
                     } else {
                         // TODO: test this case
                         error!(
@@ -247,9 +268,17 @@ async fn signaling_stream(
 
 impl Drop for WebTransportServer {
     fn drop(&mut self) {
-        let port = self.ep.local_addr().expect("Server should already have an ip on program exit").port();
-        let gw = igd_next::search_gateway(Default::default()).expect("gateway not found, cant remove port on close");
-        info!("{:?}", gw.remove_port(igd_next::PortMappingProtocol::UDP, port));
+        let port = self
+            .ep
+            .local_addr()
+            .expect("Server should already have an ip on program exit")
+            .port();
+        let gw = igd_next::search_gateway(Default::default())
+            .expect("gateway not found, cant remove port on close");
+        info!(
+            "{:?}",
+            gw.remove_port(igd_next::PortMappingProtocol::UDP, port)
+        );
     }
 }
 
@@ -259,7 +288,7 @@ fn logger() {
         .from_env_lossy();
 
     tracing_subscriber::fmt()
-        .with_target(true)
+        .with_target(false)
         .with_level(true)
         .with_env_filter(env_filter)
         .init();

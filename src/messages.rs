@@ -1,5 +1,6 @@
 use mime_guess::Mime;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use wtransport::SendStream;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -16,8 +17,10 @@ pub struct Response {
     /// Empty String means we dont know!
     mime: String,
 
-	#[serde(with = "serde_bytes")]
-    pub hash: [u8; 32],
+    size: u64,
+
+    #[serde(with = "serde_bytes")]
+    hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -26,12 +29,13 @@ pub struct ErrorResponse {
 }
 
 impl Response {
-    pub fn new_success(hash: [u8; 32], filename: String, mime: Option<Mime>) -> Self {
+    pub fn new_success(hash: [u8; 32], filename: String, mime: Option<Mime>, size: u64) -> Self {
         Self {
             status: 200,
-			hash,
+            hash,
             filename,
             mime: mime.map(|m| m.essence_str().into()).unwrap_or_default(),
+            size,
         }
     }
 }
