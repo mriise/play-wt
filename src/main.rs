@@ -235,7 +235,6 @@ async fn signaling_stream(
 
                         let mut uni = connection.open_uni().await?.await?;
                         debug!("Uni stream created, now sending file");
-
                         uni.write_all(&file).await?;
                     } else {
                         // TODO: test this case

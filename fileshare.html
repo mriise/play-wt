@@ -1,10 +1,7 @@
 <body>
-    <!-- <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4/dist/blake3.umd.min.js"></script> -->
-
     <script type="module">
         import { Encoder, Decoder, encode } from 'https://cdn.jsdelivr.net/npm/cbor-x@1.5.8/+esm'
-        import {createBLAKE3} from 'https://cdn.jsdelivr.net/npm/hash-wasm@4/dist/blake3.umd.min.js/+esm'
-        
+        import { createBLAKE3 } from 'https://cdn.jsdelivr.net/npm/hash-wasm@4/dist/blake3.umd.min.js/+esm'
 
         const ADDR_NAME = "wtAddress";
         const CERTHASH_NAME = "wtCerthash";
@@ -47,12 +44,14 @@
                 });
                 window.transport = transport;
             }
-            
+
 
             // console.log(transport)
             await transport.ready;
 
             // Create a bidirectional stream
+            // Every request will have its own bi stream
+            // every file will be a uni from the server to the client
             let stream = await transport.createBidirectionalStream();
 
             // readFromIncomingStream(stream.readable, 0);
@@ -97,7 +96,7 @@
                 while (true) {
                     const { value, done } = await reader.read();
                     if (done) {
-                        console.log('Stream #' + number + ' closed');
+                        console.log('Stream #' + number + ' done');
                         let joined = joinChunks(chunks);
                         // console.log(btoa(value));
                         let cborMessage = Object.fromEntries(d.decode(joined).entries());
@@ -119,10 +118,8 @@
                         }
                         return;
                     }
-                    
+
                     chunks.push(value);
-                    // console.log(file);
-                    // saveBlob(file, cborMessage.filename);
                 }
             } catch (e) {
                 console.error(
@@ -131,6 +128,8 @@
         }
 
         // https://stackoverflow.com/a/49129872
+        // doing this isnt particulary great, but its only for small CBOR messages
+        // so its not too bad.
         function joinChunks(chunks) {
             // Get the total length of all arrays.
             let length = 0;
@@ -169,7 +168,7 @@
             // the fact we even have to do this...
             while (window.downloading.at(0) === undefined) {
                 console.log(window.downloading)
-                await new Promise(r => setTimeout(r, 100)); 
+                await new Promise(r => setTimeout(r, 100));
             }
             let fileInfo = window.downloading.shift();
             // prep file for saving
@@ -215,6 +214,8 @@
                         // TODO: not this filename, the one the user made
                         alert(fileInfo.filename + " failed verification. DO NOT TRUST")
                     }
+                    // close out our hasher
+                    window.BLAKE3.init()
                     // update UI
                     updateDownloadProgress(hashText, 100)
                     break;
@@ -226,7 +227,7 @@
 
                 // update UI
                 totalWritten += value.length;
-                updateDownloadProgress(hashText, Math.floor((totalWritten/fileInfo.size)*100))
+                updateDownloadProgress(hashText, Math.floor((totalWritten / fileInfo.size) * 100))
             }
         }
 
@@ -284,7 +285,7 @@
 
             var bar = document.createElement("div");
             bar.classList.add("progressBar")
-            
+
             var barInner = document.createElement("div");
             barInner.id = hashText + "-bar";
             barInner.classList.add("progressBarInner")
@@ -363,6 +364,7 @@
             font-weight: bold;
             font-size: large;
         }
+
         .file span div {
             font-size: small;
             padding: 2px;
@@ -385,6 +387,6 @@
     </form>
 
     <div id="downloads" style="display: flex; flex-direction: column;">
-        
+
     </div>
 </body>
