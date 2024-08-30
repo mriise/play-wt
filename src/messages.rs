@@ -4,13 +4,20 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use wtransport::SendStream;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Request {
+pub struct SignalRequest {
     #[serde(with = "serde_bytes")]
     pub hash: [u8; 32],
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum Signal {
+    Fetch(SignalRequest),
+    // Put()
+}
+
 #[derive(Serialize, Deserialize)]
-pub struct Response {
+pub struct FetchResponse {
     status: u32,
 
     filename: String,
@@ -28,7 +35,7 @@ pub struct ErrorResponse {
     pub status: u32,
 }
 
-impl Response {
+impl FetchResponse {
     pub fn new_success(hash: [u8; 32], filename: String, mime: Option<Mime>, size: u64) -> Self {
         Self {
             status: 200,

@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
-wtransport = "0.1.10"
+tokio = { version = "1.39.3", features = ["full"] }
+wtransport = "0.2.0"
 thiserror = "1.0"
 data-encoding = "2.5.0"
 anyhow = "1.0.79"
@@ -15,12 +15,13 @@ tracing = "0.1.40"
 tracing-subscriber = {version = "0.3.18", features = ["env-filter"]}
 notify = { version = "6.1.1", default-features = false, features = ["macos_kqueue"] }
 notify-debouncer-full = "0.3.1"
-blake3 = { version = "1.5.0", features = ["mmap", "rayon"]}
+blake3 = { version = "1.5.4", features = ["mmap", "rayon"]}
 serde = { version = "1.0", features = ["derive"] }
-cbor4ii = { version = "0.3.2", features = ["use_std", "serde1"]}
-serde_bytes = "0.11"
-redb = "1.5.0"
+cbor4ii = { version = "0.3.3", features = ["use_std", "serde1"]}
+serde_bytes = "0.11.15"
+redb = "2.1.2"
 mime_guess = "2.0"
 igd-next = "0.14.3"
-local-ip-address = "0.5.7"
+local-ip-address = "0.5.3"
 serde_repr = "0.1.18"
+netdev = "0.30"

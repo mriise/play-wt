@@ -1,3 +1,9 @@
+<html lang="en-US">
+<title>Simple File Share</title>
+<head>
+    <meta name="viewport" content="width=device-width">
+    <meta charset="utf-8">
+</head>
 <body>
     <script type="module">
         import { Encoder, Decoder, encode } from 'https://cdn.jsdelivr.net/npm/cbor-x@1.5.8/+esm'
@@ -48,6 +54,9 @@
 
             // console.log(transport)
             await transport.ready;
+
+            //TODO: abstract signaling stream and fetch/retreive into different functions
+            document.getElementById("")
 
             // Create a bidirectional stream
             // Every request will have its own bi stream
@@ -231,6 +240,46 @@
             }
         }
 
+        async function debugSendTextFile(transport, text) {
+            const encoder = new TextEncoder();
+            const encoded = encoder.encode(text);
+            await sendUni(transport, encoded);
+        }
+
+        async function sendFile(transport) {
+            const files = await window.showOpenFilePicker();
+            const file = await files[0].getFile();
+
+            const buffer = await file.arrayBuffer();
+            console.log(buffer);
+
+            await sendUni(transport, buffer);
+        }
+
+        window.sendClick = sendFile;
+        async function sendUni(transport, buffer) {
+            const uds = await transport.createUnidirectionalStream();
+            
+            const writer = uds.getWriter();
+
+            try {
+                await writer.ready;
+                await writer.write(buffer);
+                // for (const chunk of buffer) {
+                //     await writer.ready;
+                //     await writer.write(chunk);
+                //     console.log("Chunk written to sink.");
+                // }
+                // Call ready again to ensure that all chunks are written
+                // before closing the writer.
+                await writer.ready;
+                await writer.close();
+                console.log("All chunks written");
+            } catch (err) {
+                console.log("Error:", err);
+            }
+        }
+
         window.shareClick = async () => {
             let shareURL = new URL(window.location.href);
             shareURL.search = "";
@@ -376,8 +425,8 @@
     </style>
 
     <form onsubmit="return false">
-        <label for="wtAddress">Address and Port</label>
-        <input type="text" id="wtAddress" placeholder="Address" value="https://127.0.0.1:4433">
+        <label for="wtAddress">Location (address and port)</label>
+        <input type="text" id="wtAddress" placeholder="Address" value="https://127.0.0.1:4999">
         <label for="wtCerthash">Certhash</label>
         <input type="text" id="wtCerthash" placeholder="Certhash" style="width: 450px;">
         <label for="wtFileHash">File Hash</label>
@@ -385,8 +434,11 @@
         <button onclick="window.webtransportClick()">fetch</button>
         <button onclick="window.shareClick()" id="shareButton">share</button>
     </form>
-
+    <div>
+        <button onclick="window.sendClick(window.transport)">send</button>
+    </div>
     <div id="downloads" style="display: flex; flex-direction: column;">
 
     </div>
 </body>
+</html>

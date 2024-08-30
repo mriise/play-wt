@@ -1,26 +1,32 @@
 use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::{
-    fs,
+    fs::{self, File},
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{atomic::AtomicBool, Arc, Weak},
     time::Duration,
 };
 
 use data_encoding::BASE64URL;
-use tokio::select;
-use tracing::{debug, error, error_span, info, info_span, Instrument};
+use tokio::{
+    fs::create_dir,
+    io::{AsyncReadExt, AsyncWriteExt},
+    select,
+};
+use tracing::{debug, error, error_span, field::debug, info, info_span, warn, Instrument};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
     endpoint::{endpoint_side::Server, IncomingSession},
-    Certificate, Connection, Endpoint, RecvStream, SendStream, ServerConfig,
+    tls::Certificate,
+    Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt,
 };
 
 mod files;
 mod messages;
 
-use messages::{Request, Response};
+use messages::{FetchResponse, Signal, SignalRequest};
 
 use crate::{
     files::FileManager,
@@ -47,12 +53,14 @@ async fn main() -> Result<()> {
     let db_path = internal_root.join("databaseV1.db");
     let fs_manager = FileManager::new(fs_root, db_path, fs_rx)?;
 
-    let certificate = Certificate::self_signed(&["localhost", "127.0.0.1", "::1"]);
+    let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
 
-    info!(certhash = BASE64URL.encode(certificate.hashes()[0].as_ref()),);
+    // self signed so our certhash should be the only one
+    let cert = &identity.certificate_chain().as_ref()[0];
+    info!(certhash = BASE64URL.encode(cert.hash().as_ref()),);
 
     let port = 4999;
-    let server = WebTransportServer::new(fs_manager.db_ref(), certificate, port)?;
+    let server = WebTransportServer::new(fs_manager.db_ref(), &identity, port)?;
 
     select! {
         result = server.serve() => {
@@ -73,36 +81,62 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
         use igd_next::*;
         use local_ip_address::{local_ip, local_ipv6};
 
-        // OS gave us an ipv6 for webtransport, get our global address and print a link
+        let iface = netdev::get_default_interface().map_err(|e| anyhow::format_err!("{e}"))?;
+        debug!(default_interface =? iface);
+
+        // OS gave us an ipv6 for webtransport, get our external ip and log an address
         if local_addr.is_ipv6() {
-            info!(
-                "External IPv6 Address: https://[{}]:{}",
-                local_ipv6()?,
+            debug!(
+                "Local IPv6 Address: https://[{}]:{}",
+                local_addr.ip(),
                 local_addr.port()
-            )
+            );
+
+            
+            if let Some(ipv6) = iface.ipv6.first() {
+                info!(
+                    "External IPv6 Address: https://[{}]:{}",
+                    ipv6.addr,
+                    local_addr.port()
+                );
+            }
+            
         }
 
-        // Attempt to add portsesu to UPnP, just in case client can only use ip4
+        // Attempt to add ports to UPnP, just in case client can only use ip4
         info!("Asking Default Gateway for UPnP port");
 
-        let gw = search_gateway(SearchOptions::default())?;
+        let local_ip4 = local_ip()?;
 
-        // local ip4 (just incase our webtransport ip is v6)
-        let local_ip4 = SocketAddr::new(local_ip()?, local_addr.port());
+        // man i love rust!
+        (|| -> anyhow::Result<()> {
+            let gw = search_gateway(SearchOptions::default())?;
+            // local ip4 (just incase our webtransport ip is v6)
+            let local_ip4 = SocketAddr::new(local_ip4, local_addr.port());
 
-        debug!("Adding UPnP port with ip4 {}", local_ip4);
-        gw.add_port(
-            PortMappingProtocol::UDP,
-            local_addr.port(),
-            local_ip4,
-            WEEK_DUR,
-            "play-wt",
-        )?;
-        info!(
-            "External Address: https://{}:{}",
-            gw.get_external_ip()?,
-            local_addr.port()
-        );
+            debug!("Adding UPnP port with ip4 {}", local_ip4);
+            gw.add_port(
+                PortMappingProtocol::UDP,
+                local_addr.port(),
+                local_ip4,
+                WEEK_DUR,
+                "play-wt",
+            )?;
+            info!(
+                "External IPv4 Address: https://{}:{}",
+                gw.get_external_ip()?,
+                local_addr.port()
+            );
+
+            Ok(())
+        })().map_err(|e| {
+            if local_addr.is_ipv4() {
+                warn!("UPnP Failed. Enable UPnP on router and device and try again, or ensure ensure port {} is forwarded for {}", local_addr.port(), local_ip4);
+            } else {
+                warn!("UPnP Failed. Clients connecting through IPv4 may be unnable to connect. Enable UPnP on router and try again, or ensure ensure port {} is forwarded for {}", local_addr.port(), local_ip4);
+            }
+            debug!("{e}");
+        }).ok();
 
         Ok(())
     }
@@ -120,10 +154,10 @@ pub struct WebTransportServer {
 }
 
 impl WebTransportServer {
-    fn new(db: Arc<Database>, cert: Certificate, port: u16) -> Result<Self> {
+    fn new(db: Arc<Database>, ident: &Identity, port: u16) -> Result<Self> {
         let config = ServerConfig::builder()
-            .with_bind_config(wtransport::config::IpBindConfig::InAddrAnyDual, port)
-            .with_certificate(cert)
+            .with_bind_default(port)
+            .with_identity(ident)
             .keep_alive_interval(Some(Duration::from_secs(3)))
             .build();
 
@@ -149,7 +183,10 @@ impl WebTransportServer {
 
     async fn handle_incoming_session(db_ref: Arc<Database>, session: IncomingSession) {
         async fn handle_inner(db_ref: Arc<Database>, session: IncomingSession) -> Result<()> {
+            // not sure if having a different buffer for sending is correct or not...
+            let mut send_buffer = vec![0; 65536].into_boxed_slice();
             let mut buffer = vec![0; 65536].into_boxed_slice();
+
             let session_request = session.await?;
 
             info!(
@@ -161,19 +198,24 @@ impl WebTransportServer {
             let connection = session_request.accept().await?;
 
             info!("Waiting for data from client...");
+
+            let session_id = connection.stable_id();
+
+            let accept_put: AtomicBool = AtomicBool::new(false);
             loop {
                 tokio::select! {
                     stream = connection.accept_bi() => {
-                        signaling_stream(db_ref.clone(), stream?, &mut buffer, &connection).await?;
+                        signaling_stream(db_ref.clone(), stream?, &mut buffer, &connection, &accept_put).await?;
                     }
-                    // dgram = connection.receive_datagram() => {
-                    //     let dgram = dgram?;
-                    //     let str_data = std::str::from_utf8(&dgram)?;
+                    uni_stream = connection.accept_uni() => {
+                        if !accept_put.load(std::sync::atomic::Ordering::Relaxed) {
+                            // close and cancel if we no longer want to accept "put" requests during this session
+                            uni_stream?.stop(VarInt::from_u32(101));
+                        } else {
+                            put_stream(uni_stream?, &mut send_buffer, format!("{session_id}")).await?;
+                        }
 
-                    //     info!("Received (dgram) '{str_data}' from client");
-
-                    //     connection.send_datagram(b"ACK")?;
-                    // }
+                    }
                 }
             }
         }
@@ -182,11 +224,38 @@ impl WebTransportServer {
     }
 }
 
+async fn put_stream(
+    mut stream: RecvStream,
+    buffer: &mut Box<[u8]>,
+    put_folder: String,
+) -> Result<()> {
+    // while let Some(v) = stream.poll
+
+    // TODO: discard file on upload fail
+    let mut f = tokio::fs::File::create_new({
+        let mut p = PathBuf::from(FILES_FOLDER);
+        // p.push(&put_folder);
+        // info!("hosting for {} in {:?}", put_folder, &p);
+        // create_dir(&p).await?;
+        p.push(format!("{}_nicefilename", put_folder));
+        p
+    })
+    .await?;
+
+    while let Some(v) = stream.read(buffer).await? {
+        f.write_all(&buffer[..v]).await?;
+    }
+
+    Ok(())
+}
+
+/// a bi-directional stream used for the session for sending signals and metadata
 async fn signaling_stream(
     db_ref: Arc<Database>,
     mut stream: (SendStream, RecvStream),
     buffer: &mut Box<[u8]>,
     connection: &Connection,
+    accept_put: &AtomicBool,
 ) -> Result<()> {
     info!("Accepted BI stream");
 
@@ -197,10 +266,13 @@ async fn signaling_stream(
     };
 
     // decode
-    let decoded: Result<Request, _> = cbor4ii::serde::from_slice(&buffer[..bytes_read]);
+    let decoded: Result<Signal, _> = cbor4ii::serde::from_slice(&buffer[..bytes_read]);
+
+    // allow clients to put files into the server
+    accept_put.store(true, std::sync::atomic::Ordering::Relaxed);
 
     match decoded {
-        Ok(request) => {
+        Ok(Signal::Fetch(request)) => {
             info!("Received (bi) request from client");
 
             // search db for requested file hash
@@ -221,9 +293,10 @@ async fn signaling_stream(
 
                         let mime = mime_guess::from_path(path);
 
+                        // send the client the metadata of the file
                         send_response(
                             &mut stream.0,
-                            Response::new_success(
+                            FetchResponse::new_success(
                                 request.hash,
                                 filename.into(),
                                 mime.first(),
@@ -233,6 +306,7 @@ async fn signaling_stream(
                         .await?;
                         stream.0.finish().await?;
 
+                        // open a uni stream and shove the whole requested file down it
                         let mut uni = connection.open_uni().await?.await?;
                         debug!("Uni stream created, now sending file");
                         uni.write_all(&file).await?;
@@ -313,12 +387,12 @@ fn touch_dir(path: &Path) {
 #[test]
 fn rust_js_cbor() -> Result<()> {
     use data_encoding::{BASE64, HEXUPPER};
-    use messages::Request;
+    use messages::SignalRequest;
 
     let js_cbor_encoded = "uQABZGhhc2hYIJZms3GYoG16Z8x/2Z/3WM+6CR+R7RZSCiRdYN1QSpDe";
     let js_cbor = BASE64.decode(js_cbor_encoded.as_bytes())?;
 
-    let rust_cbor = Request {
+    let rust_cbor = SignalRequest {
         hash: BASE64URL
             .decode("cbonmWDP8UdIQ0Ff0XGPwNZlGNiH-l54Gx1nvPLvUl0=".as_bytes())?
             .try_into()
