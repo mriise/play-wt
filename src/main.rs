@@ -1,4 +1,6 @@
 use anyhow::Result;
+use certs::{CertManager};
+use const_format::concatcp;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::{
     fs::{self, File},
@@ -19,12 +21,13 @@ use tracing::{debug, error, error_span, field::debug, info, info_span, warn, Ins
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
     endpoint::{endpoint_side::Server, IncomingSession},
-    tls::Certificate,
     Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt,
 };
 
 mod files;
 mod messages;
+mod auth;
+mod certs;
 
 use messages::{FetchResponse, Signal, SignalRequest};
 
@@ -35,32 +38,44 @@ use crate::{
 
 // TODO: DB eats up more space than it seemingly needs. maybe switch to sqlite3?
 
-pub const FILE_DB: TableDefinition<&[u8; 32], files::FileMetaValue> =
-    TableDefinition::new(&"play-wt_files");
+const APP_PREFIX: &str = "play-wt";
 
-const INTERNAL_FOLDER: &str = "wt-play_internal";
-const FILES_FOLDER: &str = "wt-play_files";
+pub const FILE_TABLE: TableDefinition<&[u8; 32], files::FileMetaValue> =
+    TableDefinition::new(concatcp!(APP_PREFIX,"_files"));
+pub const AUTH_TABLE: TableDefinition<&[u8; 32], auth::AuthTokenValue> =
+    TableDefinition::new(concatcp!(APP_PREFIX,"_auth"));
+pub const UPLOAD_TABLE: TableDefinition<&[u8; 32], auth::AuthTokenValue> =
+    TableDefinition::new(concatcp!(APP_PREFIX,"_uploads"));
+
+// TODO: add readme in internal folder for curious users
+const INTERNAL_FOLDER: &str = concatcp!(APP_PREFIX,"_internal");
+const UPLOAD_FILES_FOLDER: &str = concatcp!(APP_PREFIX,"_uploaded");
+const FILES_FOLDER: &str = concatcp!(APP_PREFIX,"_files");
 
 #[tokio::main]
 async fn main() -> Result<()> {
     logger();
 
     let internal_root = build_root_folder(INTERNAL_FOLDER)?;
+    let upload_root = build_root_folder(UPLOAD_FILES_FOLDER)?;
     let fs_root = build_root_folder(FILES_FOLDER)?;
 
-    let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&fs_root)?;
+    let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&fs_root, false)?;
+    let (_upld_watcher, upld_rx) = FileManager::new_fs_notify(&upload_root, false)?;
 
     let db_path = internal_root.join("databaseV1.db");
     let fs_manager = FileManager::new(fs_root, db_path, fs_rx)?;
 
     let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
 
+    // identity.private_key().store_secret_pemfile(filepath);
+
     // self signed so our certhash should be the only one
     let cert = &identity.certificate_chain().as_ref()[0];
     info!(certhash = BASE64URL.encode(cert.hash().as_ref()),);
 
-    let port = 4999;
-    let server = WebTransportServer::new(fs_manager.db_ref(), &identity, port)?;
+    let start_config = ActiveServerConfig { port: 4999, keepalive: Some(Duration::from_secs(3)) };
+    let server = WebTransportServer::new(fs_manager.db_ref(), start_config)?;
 
     select! {
         result = server.serve() => {
@@ -79,12 +94,12 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
     const WEEK_DUR: u32 = 60 * 60 * 24 * 14;
     fn inner(local_addr: SocketAddr) -> Result<()> {
         use igd_next::*;
-        use local_ip_address::{local_ip, local_ipv6};
+        use local_ip_address::local_ip;
 
         let iface = netdev::get_default_interface().map_err(|e| anyhow::format_err!("{e}"))?;
         debug!(default_interface =? iface);
 
-        // OS gave us an ipv6 for webtransport, get our external ip and log an address
+        // OS gave us an ipv6 for webtransport, this likely means we can get our external IPv6 and log as an external address
         if local_addr.is_ipv6() {
             debug!(
                 "Local IPv6 Address: https://[{}]:{}",
@@ -130,7 +145,7 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
 
             Ok(())
         })().map_err(|e| {
-            if local_addr.is_ipv4() {
+            if iface.ipv6.is_empty() {
                 warn!("UPnP Failed. Enable UPnP on router and device and try again, or ensure ensure port {} is forwarded for {}", local_addr.port(), local_ip4);
             } else {
                 warn!("UPnP Failed. Clients connecting through IPv4 may be unnable to connect. Enable UPnP on router and try again, or ensure ensure port {} is forwarded for {}", local_addr.port(), local_ip4);
@@ -149,25 +164,40 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
 }
 
 pub struct WebTransportServer {
-    ep: Endpoint<Server>,
+    ep: Arc<Endpoint<Server>>,
     db: Arc<Database>,
+    start_config: ActiveServerConfig,
+}
+
+#[derive(Debug, Clone)]
+// TODO: other server config values as-needed
+pub struct ActiveServerConfig {
+    port: u16,
+    keepalive: Option<Duration>
 }
 
 impl WebTransportServer {
-    fn new(db: Arc<Database>, ident: &Identity, port: u16) -> Result<Self> {
+    fn new(db: Arc<Database>, start_config: ActiveServerConfig) -> Result<Self> {
         let config = ServerConfig::builder()
-            .with_bind_default(port)
-            .with_identity(ident)
-            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .with_bind_default(start_config.port)
+            .with_identity(&CertManager::startup_load_ident()?)
+            .keep_alive_interval(start_config.keepalive)
             .build();
 
         let connection = Endpoint::server(config)?;
 
-        Ok(Self { db, ep: connection })
+        Ok(Self { db, ep: Arc::new(connection), start_config: start_config })
     }
 
     pub async fn serve(self) -> Result<()> {
         let _ = upnp(self.ep.local_addr()?).await.map_err(|e| error!("{e}"));
+
+        let mut cert_manager = CertManager::new(self.ep.clone(), self.start_config.clone())?;
+
+        // start running
+        tokio::spawn( async move {
+            cert_manager.start().await.map_err(|e | error!("{e}")).ok();
+        });
 
         for id in 0.. {
             let incoming_session = self.ep.accept().await;
@@ -201,18 +231,18 @@ impl WebTransportServer {
 
             let session_id = connection.stable_id();
 
-            let accept_put: AtomicBool = AtomicBool::new(false);
+            let accept_upload: AtomicBool = AtomicBool::new(false);
             loop {
                 tokio::select! {
                     stream = connection.accept_bi() => {
-                        signaling_stream(db_ref.clone(), stream?, &mut buffer, &connection, &accept_put).await?;
+                        signaling_stream(db_ref.clone(), stream?, &mut buffer, &connection, &accept_upload).await?;
                     }
                     uni_stream = connection.accept_uni() => {
-                        if !accept_put.load(std::sync::atomic::Ordering::Relaxed) {
+                        if !accept_upload.load(std::sync::atomic::Ordering::Relaxed) {
                             // close and cancel if we no longer want to accept "put" requests during this session
                             uni_stream?.stop(VarInt::from_u32(101));
                         } else {
-                            put_stream(uni_stream?, &mut send_buffer, format!("{session_id}")).await?;
+                            upload_stream(uni_stream?, &mut send_buffer, format!("{session_id}")).await?;
                         }
 
                     }
@@ -224,7 +254,8 @@ impl WebTransportServer {
     }
 }
 
-async fn put_stream(
+// uni-directional stream from client to upload a file
+async fn upload_stream(
     mut stream: RecvStream,
     buffer: &mut Box<[u8]>,
     put_folder: String,
@@ -277,7 +308,7 @@ async fn signaling_stream(
 
             // search db for requested file hash
             let read_tx = db_ref.begin_read()?;
-            let table = read_tx.open_table(FILE_DB)?;
+            let table = read_tx.open_table(FILE_TABLE)?;
             let record = table.get(&request.hash)?;
 
             match record {

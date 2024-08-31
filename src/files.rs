@@ -46,7 +46,7 @@ impl FileManager {
         // make sure our table exists
         let db_write = db.begin_write()?;
         {
-            let _fs_table = db_write.open_table(crate::FILE_DB)?;
+            let _fs_table = db_write.open_table(crate::FILE_TABLE)?;
 
             info!("{:?}", db_write.stats()?);
         }
@@ -79,6 +79,7 @@ impl FileManager {
     /// Debouncer must not be dropped till end of program (always listen for file changes)
     pub fn new_fs_notify(
         watch_path: impl AsRef<Path>,
+        recursive: bool,
     ) -> anyhow::Result<(
         Debouncer<RecommendedWatcher, FileIdMap>,
         Receiver<DebouncedEvent>,
@@ -98,9 +99,10 @@ impl FileManager {
             Err(e) => error!("File watch error: {:?}", e),
         })?;
 
+        let recursive_mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
         debouncer
             .watcher()
-            .watch(watch_path.as_ref(), RecursiveMode::NonRecursive)?;
+            .watch(watch_path.as_ref(), recursive_mode)?;
 
         Ok((debouncer, receiver))
     }
@@ -175,7 +177,7 @@ impl FileManager {
         // add file to db
         let tx = self.db.begin_write()?;
         {
-            let mut table = tx.open_table(crate::FILE_DB)?;
+            let mut table = tx.open_table(crate::FILE_TABLE)?;
             table.insert(hash.as_bytes(), (len, name))?;
         }
         tx.commit()?;
@@ -190,7 +192,7 @@ impl FileManager {
     //
     fn remove_file(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let tx = self.db.begin_write()?;
-        let mut table = tx.open_table(crate::FILE_DB)?;
+        let mut table = tx.open_table(crate::FILE_TABLE)?;
 
         // search db for any matching file name and remove from table
         let matching: Vec<([u8; 32], String)> = {

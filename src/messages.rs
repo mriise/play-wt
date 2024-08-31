@@ -10,11 +10,31 @@ pub struct SignalRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct SignalPut {
+    filename: String,
+    /// Empty String means we dont know!
+    mime: String,
+
+    size: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SignalAuth {
+    filename: String,
+    /// Empty String means we dont know!
+    mime: String,
+
+    size: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum Signal {
     Fetch(SignalRequest),
     // Put()
 }
+
+
 
 #[derive(Serialize, Deserialize)]
 pub struct FetchResponse {
