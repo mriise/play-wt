@@ -1,5 +1,5 @@
 use anyhow::Result;
-use certs::{CertManager};
+use certs::CertManager;
 use const_format::concatcp;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::{
@@ -24,10 +24,10 @@ use wtransport::{
     Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt,
 };
 
-mod files;
-mod messages;
 mod auth;
 mod certs;
+mod files;
+mod messages;
 
 use messages::{FetchResponse, Signal, SignalRequest};
 
@@ -41,23 +41,26 @@ use crate::{
 const APP_PREFIX: &str = "play-wt";
 
 pub const FILE_TABLE: TableDefinition<&[u8; 32], files::FileMetaValue> =
-    TableDefinition::new(concatcp!(APP_PREFIX,"_files"));
+    TableDefinition::new(concatcp!(APP_PREFIX, "_files"));
 pub const AUTH_TABLE: TableDefinition<&[u8; 32], auth::AuthTokenValue> =
-    TableDefinition::new(concatcp!(APP_PREFIX,"_auth"));
+    TableDefinition::new(concatcp!(APP_PREFIX, "_auth"));
 pub const UPLOAD_TABLE: TableDefinition<&[u8; 32], auth::AuthTokenValue> =
-    TableDefinition::new(concatcp!(APP_PREFIX,"_uploads"));
+    TableDefinition::new(concatcp!(APP_PREFIX, "_uploads"));
 
 // TODO: add readme in internal folder for curious users
-const INTERNAL_FOLDER: &str = concatcp!(APP_PREFIX,"_internal");
-const UPLOAD_FILES_FOLDER: &str = concatcp!(APP_PREFIX,"_uploaded");
-const FILES_FOLDER: &str = concatcp!(APP_PREFIX,"_files");
+const INTERNAL_FOLDER: &str = concatcp!(APP_PREFIX, "_internal");
+const INTERNAL_UPLOADED_FILES: &str = "uploaded";
+const INTERNAL_CERTS: &str = "certs";
+const INTERNAL_CERT_HISTORY_TABLE: &str = "_CERTIFICATE_HISTORY.csv";
+const FILES_FOLDER: &str = concatcp!(APP_PREFIX, "_files");
 
 #[tokio::main]
 async fn main() -> Result<()> {
     logger();
 
     let internal_root = build_root_folder(INTERNAL_FOLDER)?;
-    let upload_root = build_root_folder(UPLOAD_FILES_FOLDER)?;
+    let upload_root = build_internal_folder(&internal_root, INTERNAL_UPLOADED_FILES)?;
+    let cert_root = build_internal_folder(&internal_root, INTERNAL_CERTS)?;
     let fs_root = build_root_folder(FILES_FOLDER)?;
 
     let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&fs_root, false)?;
@@ -66,15 +69,24 @@ async fn main() -> Result<()> {
     let db_path = internal_root.join("databaseV1.db");
     let fs_manager = FileManager::new(fs_root, db_path, fs_rx)?;
 
-    let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
+    // let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
 
     // identity.private_key().store_secret_pemfile(filepath);
 
     // self signed so our certhash should be the only one
-    let cert = &identity.certificate_chain().as_ref()[0];
-    info!(certhash = BASE64URL.encode(cert.hash().as_ref()),);
+    // let cert = &identity.certificate_chain().as_ref()[0];
+    // info!(certhash = BASE64URL.encode(cert.hash().as_ref()),);
 
-    let start_config = ActiveServerConfig { port: 4999, keepalive: Some(Duration::from_secs(3)) };
+    let start_config = ActiveServerConfig {
+        port: 4999,
+        cert_root,
+        keepalive: Some(Duration::from_secs(3)),
+        subject_alt_names: vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ],
+    };
     let server = WebTransportServer::new(fs_manager.db_ref(), start_config)?;
 
     select! {
@@ -107,7 +119,6 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
                 local_addr.port()
             );
 
-            
             if let Some(ipv6) = iface.ipv6.first() {
                 info!(
                     "External IPv6 Address: https://[{}]:{}",
@@ -115,7 +126,6 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
                     local_addr.port()
                 );
             }
-            
         }
 
         // Attempt to add ports to UPnP, just in case client can only use ip4
@@ -173,32 +183,49 @@ pub struct WebTransportServer {
 // TODO: other server config values as-needed
 pub struct ActiveServerConfig {
     port: u16,
-    keepalive: Option<Duration>
+    keepalive: Option<Duration>,
+    cert_root: PathBuf,
+    /// subject alt name changes will only reflect on new certs
+    subject_alt_names: Vec<String>,
 }
 
 impl WebTransportServer {
     fn new(db: Arc<Database>, start_config: ActiveServerConfig) -> Result<Self> {
+        // temporary ident until the cert manager takes over
+        let temp_identity = Identity::self_signed(&start_config.subject_alt_names)?;
+
         let config = ServerConfig::builder()
             .with_bind_default(start_config.port)
-            .with_identity(&CertManager::startup_load_ident()?)
+            .with_identity(&temp_identity)
             .keep_alive_interval(start_config.keepalive)
             .build();
 
         let connection = Endpoint::server(config)?;
 
-        Ok(Self { db, ep: Arc::new(connection), start_config: start_config })
+        Ok(Self {
+            db,
+            ep: Arc::new(connection),
+            start_config,
+        })
     }
 
     pub async fn serve(self) -> Result<()> {
         let _ = upnp(self.ep.local_addr()?).await.map_err(|e| error!("{e}"));
 
-        let mut cert_manager = CertManager::new(self.ep.clone(), self.start_config.clone())?;
+        let mut cert_manager = CertManager::new(self.start_config.clone()).await?;
 
-        // start running
-        tokio::spawn( async move {
-            cert_manager.start().await.map_err(|e | error!("{e}")).ok();
+        // clone out of the closure so rust doesnt get mad about moving self
+        let endpoint_ref = self.ep.clone();
+        // start running cert manager
+        tokio::spawn(async move {
+            cert_manager
+                .start(endpoint_ref)
+                .await
+                .map_err(|e| error!("{e}"))
+                .ok();
         });
 
+        // accept sessoins
         for id in 0.. {
             let incoming_session = self.ep.accept().await;
 
@@ -388,7 +415,7 @@ impl Drop for WebTransportServer {
 
 fn logger() {
     let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
+        .with_default_directive(LevelFilter::TRACE.into())
         .from_env_lossy();
 
     tracing_subscriber::fmt()
@@ -400,6 +427,12 @@ fn logger() {
 
 fn build_root_folder(name: &str) -> Result<PathBuf> {
     let dir = std::env::current_dir()?.join(name);
+    touch_dir(&dir);
+    Ok(dir)
+}
+
+fn build_internal_folder(internal_root: &PathBuf, path: &str) -> Result<PathBuf> {
+    let dir = internal_root.join(path);
     touch_dir(&dir);
     Ok(dir)
 }
