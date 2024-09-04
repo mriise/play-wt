@@ -415,7 +415,7 @@ impl Drop for WebTransportServer {
 
 fn logger() {
     let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::TRACE.into())
+        .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
 
     tracing_subscriber::fmt()

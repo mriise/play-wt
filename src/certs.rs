@@ -319,31 +319,12 @@ impl CertManager {
         })
     }
 
-    // async fn generate_fresh(
-    //     date: OffsetDateTime,
-    //     start_config: &ActiveServerConfig,
-    // ) -> anyhow::Result<(RollingCert, RollingCert)> {
-
-    //     let hot_cert = RollingCert::new(
-    //         &start_config.subject_alt_names,
-    //         WeekIndex::hot_mint_index(date).date_offset(),
-    //         Some(&start_config.cert_root),
-    //     )
-    //     .await?;
-    //     let stale_cert = RollingCert::new(
-    //         &start_config.subject_alt_names,
-    //         WeekIndex::stale_mint_index(date).date_offset(),
-    //         Some(&start_config.cert_root),
-    //     )
-    //     .await?;
-    //     Ok((hot_cert, stale_cert))
-    // }
-
     /// make new certs every 7 days, such that there will always be 2 valid certs
     /// always run on the current stale, hold hot in buffer, and only generate next cert until stale expires
     pub async fn start(&mut self, ep: Arc<Endpoint<Server>>) -> anyhow::Result<()> {
         self.ep = Some(ep);
-        let d_span = debug_span!("Cert Manager");
+        let span = info_span!("Cert Manager");
+        let _enter = span.enter();
 
         // initial reload
         let new_config = ServerConfig::builder()
@@ -361,7 +342,7 @@ impl CertManager {
         let mut debug_timeskip = 0;
         // tick every min
         loop {
-            let _enter = d_span.enter();
+            let _enter = span.enter();
 
             let now = time::OffsetDateTime::now_utc();
 
