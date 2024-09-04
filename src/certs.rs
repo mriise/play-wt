@@ -104,7 +104,7 @@ impl RollingCert {
             identity: new_cert(subject_alt_names, not_before.date_offset())?,
             week_index: not_before,
         };
-        warn!(new_cert =? new);
+        debug!(new_cert =? new);
         if let Some(cert_path) = flush_path {
             let mut csv_path = cert_path.clone();
             csv_path.push(crate::INTERNAL_CERT_HISTORY_TABLE);
@@ -217,6 +217,8 @@ impl RollingCert {
 }
 
 /// week index starts on sunday at midnight of the current week, such that the index of the current time will give us the cert that was made for this week
+/// TODO: this description is like partially against implementation at least, i have not the brain effort to re-think what _exactly_ the implementation is doing 
+///     compared to what i planned for it to do.
 #[derive(Debug, Clone, Copy)]
 pub struct WeekIndex(u16);
 const UNIX_WEEK: i64 = 604_800;
@@ -229,6 +231,7 @@ impl WeekIndex {
             .unwrap()
     }
 
+    // TODO: remove this because i really dont feel safe messing with days when we should be able to find this using previous index
     fn hot_mint_index(now: OffsetDateTime) -> Self {
         now.sub(Duration::days(7)).into()
     }
@@ -304,7 +307,7 @@ impl CertManager {
         let span = debug_span!("CertManager Startup");
         let _entered = span.enter();
         debug!("loading certs from files");
-        let (hot_cert, stale_cert) = Self::load_certs(inital_now, &start_config).await.unwrap();
+        let (stale_cert, hot_cert) = Self::load_certs(inital_now, &start_config).await.unwrap();
         // .unwrap_or(Self::generate_fresh(inital_now, &start_config).await?);
         Ok(Self {
             hot_cert,
@@ -342,15 +345,14 @@ impl CertManager {
         self.ep = Some(ep);
         let d_span = debug_span!("Cert Manager");
 
-        // TODO: this is bad and stupid dont do this im tired and just guessing...
-        std::mem::swap(&mut self.stale_cert, &mut self.hot_cert);
         // initial reload
         let new_config = ServerConfig::builder()
             .with_bind_default(self.start_config.port)
             .with_identity(&self.stale_cert.identity)
             .keep_alive_interval(self.start_config.keepalive)
             .build();
-        info!(hot_cert=?self.hot_cert, stale_cert=?self.stale_cert, "reloading with initial certs");
+        debug!(hot_cert=?self.hot_cert, stale_cert=?self.stale_cert, "Reloading with initial certs.");
+        info!(passkey=self.client_passkey(), "Initial client Passkey.");
         // if let is unfortunately needed, we know from the function call that this is always Some.
         if let Some(ep) = &self.ep {
             ep.reload_config(new_config, false)?
@@ -383,8 +385,10 @@ impl CertManager {
                 )
                 .await?;
 
-                info!(hot_cert=?self.hot_cert, stale_cert=?self.stale_cert, "creating new certs and reloading");
-
+                debug_assert!(self.hot_cert.week_index.int() == self.stale_cert.week_index.int() + 1);
+                debug!(hot_cert=?self.hot_cert, stale_cert=?self.stale_cert, "creating new certs and reloading");
+                info!(passkey=self.client_passkey(), "Client Passkey updated.");
+                
                 // TODO: rebind & hot config reload
                 // use the new stale cert
                 let new_config = ServerConfig::builder()
@@ -416,9 +420,9 @@ impl CertManager {
         now: OffsetDateTime,
         config: &ActiveServerConfig,
     ) -> anyhow::Result<(RollingCert, RollingCert)> {
-        let hot_index = WeekIndex::hot_mint_index(now);
+        let hot_index = WeekIndex::hot_mint_index(now).next_index();
         let stale_index = hot_index.previous_index();
-        debug_assert_ne!(hot_index.int(), stale_index.int());
+        debug_assert!(hot_index.int() > stale_index.int());
         debug!(hot_index =? hot_index, stale_index =? stale_index, "loading certs for hot and stale indexes");
         // (stale, hot)
         let mut certs = (None, None);
@@ -493,6 +497,13 @@ impl CertManager {
             ),
         };
         Ok(out)
+    }
+
+    /// base64url encode raw bytes of week index and cert hash in order of (stale, hot) 
+    /// e.g. `[stale_index: u16, stale_hash: [u8; 32], hot_index: u16, hot_hash: [u8; 32]]`
+    /// this gives the client a `4>n>2` week window to access this server
+    fn client_passkey(&self) -> String {
+        data_encoding::BASE64URL.encode(&[self.stale_cert.serialize(), self.hot_cert.serialize()].concat())
     }
 }
 
