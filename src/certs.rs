@@ -9,10 +9,9 @@ use std::time::SystemTime;
 use crate::{error, ActiveServerConfig};
 
 use serde::{Deserialize, Serialize};
-use time::format_description::modifier::UnixTimestamp;
-use time::{Duration, OffsetDateTime};
 use tokio::fs::remove_file;
 // use tokio::fs::read_dir;
+use time::{Duration, OffsetDateTime};
 use tokio::select;
 use tracing::{debug, debug_span, info, info_span, trace, warn};
 use wtransport::endpoint::endpoint_side::Server;
@@ -34,7 +33,6 @@ where
     use rcgen::DnType;
     use rcgen::KeyPair;
     use rcgen::PKCS_ECDSA_P256_SHA256;
-    use time::Duration;
 
     let subject_alt_names = subject_alt_names
         .into_iter()
@@ -75,7 +73,7 @@ impl Debug for RollingCert {
         f.debug_struct("RollingCert")
             .field("week_index", &self.week_index.int())
             .field("certhash", &self.certhash_base64url())
-            .field("mint_date", &self.week_index.date_offset())
+            .field("mint_date", &self.week_index.utc_date())
             .finish()
     }
 }
@@ -101,7 +99,7 @@ impl RollingCert {
         S: AsRef<str>,
     {
         let new = Self {
-            identity: new_cert(subject_alt_names, not_before.date_offset())?,
+            identity: new_cert(subject_alt_names, not_before.utc_date())?,
             week_index: not_before,
         };
         debug!(new_cert =? new);
@@ -131,10 +129,6 @@ impl RollingCert {
             new.flush_to_csv(&csv_path)?;
         }
         Ok(new)
-    }
-
-    fn next_mint_date(&self) -> OffsetDateTime {
-        self.week_index.next_index().date_offset()
     }
 
     pub fn certhash_base64url(&self) -> String {
@@ -181,7 +175,7 @@ impl RollingCert {
         wtr.serialize(CertRecord {
             week_index: self.week_index.0,
             certhash_base64: self.certhash_base64url(),
-            mint_date: self.week_index.date_offset().to_string(),
+            mint_date: self.week_index.utc_date().to_string(),
         })?;
 
         for item in buffer {
@@ -216,33 +210,73 @@ impl RollingCert {
     }
 }
 
-/// week index starts on sunday at midnight of the current week, such that the index of the current time will give us the cert that was made for this week
-/// TODO: this description is like partially against implementation at least, i have not the brain effort to re-think what _exactly_ the implementation is doing 
+/// Number of weeks since UNIX EPOCH. no leap-anything, no timezones.
+/// week index starts on sunday at midnight of the current unix week, such that the index of the current time will give us the cert that was made for this week
+/// TODO: this description is like partially against implementation at least, i have not the brain effort to re-think what _exactly_ the implementation is doing
 ///     compared to what i planned for it to do.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WeekIndex(u16);
-const UNIX_WEEK: i64 = 604_800;
-const UNIX_UTC_OFFSET: i64 = 345_600;
+const UNIX_WEEK: u64 = 604_800;
+const UNIX_DAY: u64 = 86_400;
+const UNIX_HOUR: u64 = 3_600;
+const UNIX_MINUTE: u64 = 60;
+const UNIX_UTC_OFFSET: u64 = 345_600;
 
 impl WeekIndex {
-    /// sunday at midnight of last week so when we have make certs they overlapping for 7 days and valid for this week
-    fn date_offset(&self) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp((self.0 as i64).mul(UNIX_WEEK).add(UNIX_UTC_OFFSET))
-            .unwrap()
+    /// Convert out of unix time into UTC.
+    fn utc_date(&self) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(
+            (self.0 as i64)
+                .mul(UNIX_WEEK as i64)
+                .add(UNIX_UTC_OFFSET as i64),
+        )
+        .unwrap()
     }
 
-    // TODO: remove this because i really dont feel safe messing with days when we should be able to find this using previous index
-    fn hot_mint_index(now: OffsetDateTime) -> Self {
-        now.sub(Duration::days(7)).into()
+    /// get the current week index, rounding up
+    fn from_unix(ts: u64) -> Self {
+        Self(ts.div_ceil(UNIX_WEEK) as u16)
     }
-    fn stale_mint_index(now: OffsetDateTime) -> Self {
-        now.sub(Duration::days(14)).into()
+
+    fn now() -> Self {
+        Self::from_unix(
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .unwrap()
+                .as_secs(),
+        )
     }
+
+    fn to_unix(&self) -> u64 {
+        self.0 as u64 * UNIX_WEEK
+    }
+
+    /// human readable seconds as `week|day|hour|minute|second`
+    fn duration_display(mut seconds: u64) -> String {
+        let weeks = seconds / UNIX_WEEK;
+        seconds %= UNIX_WEEK;
+        let days = seconds / UNIX_DAY;
+        seconds %= UNIX_DAY;
+        let hours = seconds / UNIX_HOUR;
+        seconds %= UNIX_HOUR;
+        let minutes = seconds / UNIX_MINUTE;
+        seconds %= UNIX_MINUTE;
+        format!("{weeks}w{days}d{hours}h{minutes}m{seconds}s")
+    }
+
     fn next_index(&self) -> Self {
         Self(self.0 + 1).into()
     }
     fn previous_index(&self) -> Self {
         Self(self.0 - 1).into()
+    }
+
+    fn current_hot(&self) -> Self {
+        self.previous_index()
+    }
+
+    fn current_stale(&self) -> Self {
+        self.previous_index().previous_index()
     }
 
     fn int(&self) -> u16 {
@@ -253,40 +287,46 @@ impl WeekIndex {
     /// (cert, key)
     fn index_cert_key_files(&self, root_path: &PathBuf) -> (PathBuf, PathBuf) {
         let mut cert_path = root_path.clone();
-        cert_path.push(format!("{}{}", self.0, CertManager::CERT_SUFFIX));
+        cert_path.push(format!("{}{}", self.0, CertManager::CERT_FILE_SUFFIX));
         let mut key_path = root_path.clone();
-        key_path.push(format!("{}{}", self.0, CertManager::KEY_SUFFIX));
+        key_path.push(format!("{}{}", self.0, CertManager::KEY_FILE_SUFFIX));
         (cert_path, key_path)
-    }
-}
-
-impl From<OffsetDateTime> for WeekIndex {
-    fn from(value: OffsetDateTime) -> Self {
-        let unix_ts = value.unix_timestamp();
-        // https://stackoverflow.com/a/64293860
-        Self((unix_ts.add(UNIX_UTC_OFFSET).div(UNIX_WEEK)) as u16)
     }
 }
 
 #[test]
 fn week_index() {
-    let now = time::OffsetDateTime::now_utc();
+    // let now_index = WeekIndex::now().previous_index().to_unix();
+    let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
 
     for day in 0..32 {
-        let day = now.checked_add(Duration::days(day)).unwrap();
-        let index = WeekIndex::from(day);
+        let day = now.checked_add(day * UNIX_DAY).unwrap();
+        let index = WeekIndex::from_unix(day);
         println!(
             "{:?}\n\tnext {}\n\thot {}\n\tstale {}",
             index,
-            index.date_offset(),
-            WeekIndex::hot_mint_index(day).date_offset(),
-            WeekIndex::stale_mint_index(day).date_offset()
+            index.utc_date(),
+            index.current_hot().utc_date(),
+            index.current_stale().utc_date()
+        );
+        println!("{}", WeekIndex::duration_display(index.to_unix() - now));
+    }
+}
+
+#[test]
+fn week_index_convert() {
+    for i in 0..100 {
+        let current = WeekIndex(i as u16);
+
+        assert_eq!(current.to_unix(), i * UNIX_WEEK);
+        assert_eq!(
+            current.to_unix(),
+            OffsetDateTime::UNIX_EPOCH
+                .checked_add(Duration::weeks(i as i64))
+                .unwrap()
+                .unix_timestamp() as u64
         );
     }
-    println!(
-        "epoch index {:?}",
-        WeekIndex::from(OffsetDateTime::UNIX_EPOCH)
-    )
 }
 
 pub struct CertManager {
@@ -298,11 +338,11 @@ pub struct CertManager {
 }
 
 impl CertManager {
-    const KEY_SUFFIX: &str = "_key.pem";
-    const CERT_SUFFIX: &str = "_cert.pem";
+    const KEY_FILE_SUFFIX: &'static str = "_key.pem";
+    const CERT_FILE_SUFFIX: &'static str = "_cert.pem";
 
     pub async fn new(start_config: ActiveServerConfig) -> anyhow::Result<Self> {
-        let inital_now = time::OffsetDateTime::now_utc();
+        let inital_now = WeekIndex::now();
 
         let span = debug_span!("CertManager Startup");
         let _entered = span.enter();
@@ -333,7 +373,7 @@ impl CertManager {
             .keep_alive_interval(self.start_config.keepalive)
             .build();
         debug!(hot_cert=?self.hot_cert, stale_cert=?self.stale_cert, "Reloading with initial certs.");
-        info!(passkey=self.client_passkey(), "Initial client Passkey.");
+        info!(passkey = self.client_passkey(), "Initial client Passkey.");
         // if let is unfortunately needed, we know from the function call that this is always Some.
         if let Some(ep) = &self.ep {
             ep.reload_config(new_config, false)?
@@ -344,17 +384,23 @@ impl CertManager {
         loop {
             let _enter = span.enter();
 
-            let now = time::OffsetDateTime::now_utc();
+            let now = WeekIndex::now();
 
-            // REMOVEME
-            let now = now.add(Duration::hours(debug_timeskip));
+            let remaining = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+                - self.stale_cert.week_index.next_index().to_unix();
             debug!(
-                "TICK. time till new cert {:#}",
-                self.stale_cert.next_mint_date() - now
+                "TICK. time till new cert {}",
+                WeekIndex::duration_display(remaining)
             );
 
+            trace!(
+                "now: {:?}, hot: {:?}, stale: {:?}",
+                now,
+                self.hot_cert.week_index,
+                self.stale_cert.week_index
+            );
             // make a new cert and push out stale
-            if now >= self.stale_cert.next_mint_date() {
+            if now > self.hot_cert.week_index.next_index() {
                 let expired_week_index = self.stale_cert.week_index;
 
                 // swap because we cant deref either safely
@@ -366,10 +412,12 @@ impl CertManager {
                 )
                 .await?;
 
-                debug_assert!(self.hot_cert.week_index.int() == self.stale_cert.week_index.int() + 1);
+                debug_assert!(
+                    self.hot_cert.week_index.int() == self.stale_cert.week_index.int() + 1
+                );
                 debug!(hot_cert=?self.hot_cert, stale_cert=?self.stale_cert, "creating new certs and reloading");
-                info!(passkey=self.client_passkey(), "Client Passkey updated.");
-                
+                info!(passkey = self.client_passkey(), "Client Passkey updated.");
+
                 // TODO: rebind & hot config reload
                 // use the new stale cert
                 let new_config = ServerConfig::builder()
@@ -382,7 +430,8 @@ impl CertManager {
                     ep.reload_config(new_config, false)?
                 }
 
-                let (cert_path, key_path) =  expired_week_index.index_cert_key_files(&self.start_config.cert_root);
+                let (cert_path, key_path) =
+                    expired_week_index.index_cert_key_files(&self.start_config.cert_root);
                 debug!("cleaning up old cert and key {cert_path:?}   {key_path:?}");
                 // TODO another thread for this one please thankyhohu
                 remove_file(cert_path).await?;
@@ -398,11 +447,11 @@ impl CertManager {
     /// load certs from internal cert folder with naming following `<week_index>_cert.pem`&`<week_index>_key.pem` (not exact but for our purposed good enough)
     /// `(stale, hot)`
     pub async fn load_certs(
-        now: OffsetDateTime,
+        now: WeekIndex,
         config: &ActiveServerConfig,
     ) -> anyhow::Result<(RollingCert, RollingCert)> {
-        let hot_index = WeekIndex::hot_mint_index(now).next_index();
-        let stale_index = hot_index.previous_index();
+        let hot_index = now.current_hot();
+        let stale_index = now.current_stale();
         debug_assert!(hot_index.int() > stale_index.int());
         debug!(hot_index =? hot_index, stale_index =? stale_index, "loading certs for hot and stale indexes");
         // (stale, hot)
@@ -480,11 +529,12 @@ impl CertManager {
         Ok(out)
     }
 
-    /// base64url encode raw bytes of week index and cert hash in order of (stale, hot) 
+    /// base64url encode raw bytes of week index and cert hash in order of (stale, hot)
     /// e.g. `[stale_index: u16, stale_hash: [u8; 32], hot_index: u16, hot_hash: [u8; 32]]`
     /// this gives the client a `4>n>2` week window to access this server
     fn client_passkey(&self) -> String {
-        data_encoding::BASE64URL.encode(&[self.stale_cert.serialize(), self.hot_cert.serialize()].concat())
+        data_encoding::BASE64URL
+            .encode(&[self.stale_cert.serialize(), self.hot_cert.serialize()].concat())
     }
 }
 

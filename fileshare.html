@@ -7,7 +7,10 @@
 <body>
     <script type="module">
         import { Encoder, Decoder, encode } from 'https://cdn.jsdelivr.net/npm/cbor-x@1.5.8/+esm'
-        import { createBLAKE3 } from 'https://cdn.jsdelivr.net/npm/hash-wasm@4/dist/blake3.umd.min.js/+esm'
+        import { createBLAKE3 } from 'https://cdn.jsdelivr.net/npm/hash-wasm@4.11.0/dist/blake3.umd.min.js/+esm'
+        // https://github.com/paulmillr/noble-ed25519/tree/90058fe15f3724b02caa5b4ab803da393e7bb8ef
+        // TODO: use builtin WebCrypto ed25519 impl.
+        import {verify, sign} from 'https://cdn.jsdelivr.net/npm/@noble/ed25519@2.1.0/+esm'
 
         const ADDR_NAME = "wtAddress";
         const CERTHASH_NAME = "wtCerthash";

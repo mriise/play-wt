@@ -1,3 +1,4 @@
 /target
 play-wt*/
 /.vscode
+*.pem
