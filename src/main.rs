@@ -1,7 +1,7 @@
 use anyhow::Result;
 use certs::CertManager;
 use const_format::concatcp;
-use redb::{Database, ReadableTable, TableDefinition};
+use sqlx::{Executor, SqliteConnection, SqlitePool, Row};
 use std::{
     fs::{self, File},
     io::Write,
@@ -38,14 +38,11 @@ use crate::{
 
 // TODO: DB eats up more space than it seemingly needs. maybe switch to sqlite3?
 
-const APP_PREFIX: &str = "play-wt";
+const APP_PREFIX: &str = "playwt";
 
-pub const FILE_TABLE: TableDefinition<&[u8; 32], files::FileMetaValue> =
-    TableDefinition::new(concatcp!(APP_PREFIX, "_files"));
-pub const AUTH_TABLE: TableDefinition<&[u8; 32], auth::AuthTokenValue> =
-    TableDefinition::new(concatcp!(APP_PREFIX, "_auth"));
-pub const UPLOAD_TABLE: TableDefinition<&[u8; 32], auth::AuthTokenValue> =
-    TableDefinition::new(concatcp!(APP_PREFIX, "_uploads"));
+pub const FILE_TABLE: &str = concatcp!(APP_PREFIX, "_files");
+pub const AUTH_TABLE: &str = concatcp!(APP_PREFIX, "_auth");
+pub const UPLOAD_TABLE: &str = concatcp!(APP_PREFIX, "_uploads");
 
 // TODO: add readme in internal folder for curious users
 const INTERNAL_FOLDER: &str = concatcp!(APP_PREFIX, "_internal");
@@ -66,8 +63,12 @@ async fn main() -> Result<()> {
     let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&fs_root, false)?;
     let (_upld_watcher, upld_rx) = FileManager::new_fs_notify(&upload_root, false)?;
 
-    let db_path = internal_root.join("databaseV1.db");
-    let fs_manager = FileManager::new(fs_root, db_path, fs_rx)?;
+    let mut db_path = internal_root;
+    db_path.push("databseV1.db");
+    info!("{}", db_path.to_string_lossy());
+    let db = init_db(db_path).await?;
+
+    let fs_manager = FileManager::new(fs_root, db.clone(), fs_rx).await?;
 
     // let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
 
@@ -87,7 +88,7 @@ async fn main() -> Result<()> {
             "::1".to_string(),
         ],
     };
-    let server = WebTransportServer::new(fs_manager.db_ref(), start_config)?;
+    let server = WebTransportServer::new(db.clone(), start_config)?;
 
     select! {
         result = server.serve() => {
@@ -175,7 +176,7 @@ async fn upnp(local_addr: SocketAddr) -> Result<()> {
 
 pub struct WebTransportServer {
     ep: Arc<Endpoint<Server>>,
-    db: Arc<Database>,
+    db: SqlitePool,
     start_config: ActiveServerConfig,
 }
 
@@ -190,7 +191,7 @@ pub struct ActiveServerConfig {
 }
 
 impl WebTransportServer {
-    fn new(db: Arc<Database>, start_config: ActiveServerConfig) -> Result<Self> {
+    fn new(db: SqlitePool, start_config: ActiveServerConfig) -> Result<Self> {
         // temporary ident until the cert manager takes over
         let temp_identity = Identity::self_signed(&start_config.subject_alt_names)?;
 
@@ -238,8 +239,8 @@ impl WebTransportServer {
         Ok(())
     }
 
-    async fn handle_incoming_session(db_ref: Arc<Database>, session: IncomingSession) {
-        async fn handle_inner(db_ref: Arc<Database>, session: IncomingSession) -> Result<()> {
+    async fn handle_incoming_session(db_ref: SqlitePool, session: IncomingSession) {
+        async fn handle_inner(db_ref: SqlitePool, session: IncomingSession) -> Result<()> {
             // not sure if having a different buffer for sending is correct or not...
             let mut send_buffer = vec![0; 65536].into_boxed_slice();
             let mut buffer = vec![0; 65536].into_boxed_slice();
@@ -309,7 +310,7 @@ async fn upload_stream(
 
 /// a bi-directional stream used for the session for sending signals and metadata
 async fn signaling_stream(
-    db_ref: Arc<Database>,
+    db_ref: SqlitePool,
     mut stream: (SendStream, RecvStream),
     buffer: &mut Box<[u8]>,
     connection: &Connection,
@@ -334,14 +335,14 @@ async fn signaling_stream(
             info!("Received (bi) request from client");
 
             // search db for requested file hash
-            let read_tx = db_ref.begin_read()?;
-            let table = read_tx.open_table(FILE_TABLE)?;
-            let record = table.get(&request.hash)?;
+            let q = format!("SELECT * FROM {FILE_TABLE} WHERE Hash = $1");
+            let q = sqlx::query(&q).bind(BASE64URL.encode(&request.hash));
+            let record: Option<(String, i64)> = db_ref.fetch_optional(q).await?.map(|row| (row.get(1), row.get(2)));
 
             match record {
                 Some(record) => {
-                    let (size, filename) = record.value();
-                    let path = std::env::current_dir()?.join(FILES_FOLDER).join(filename);
+                    let (filename, size) = record;
+                    let path = std::env::current_dir()?.join(FILES_FOLDER).join(&filename);
 
                     if let Ok(file) = std::fs::read(&path) {
                         info!(
@@ -358,7 +359,7 @@ async fn signaling_stream(
                                 request.hash,
                                 filename.into(),
                                 mime.first(),
-                                size,
+                                size as u64,
                             ),
                         )
                         .await?;
@@ -446,6 +447,17 @@ fn touch_dir(path: &Path) {
             let _ = fs::create_dir(&path).map_err(|e| error!("{e}"));
         }
     }
+}
+
+async fn init_db(path: impl AsRef<Path>) -> anyhow::Result<SqlitePool> {
+    let path = path.as_ref();
+    use sqlx::prelude::*;
+    use sqlx::sqlite::*;
+    // create or do nothing
+    let c = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::default())?;
+    c.close().map_err(|(_, e)| e)?;
+    let conn = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path)).await?;
+    Ok(conn)
 }
 
 #[test]
