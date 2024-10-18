@@ -1,21 +1,25 @@
 use anyhow::Result;
+use auth::{AddAuth, ReservationAuthority, UnverifiedKey};
 use certs::CertManager;
 use const_format::concatcp;
-use sqlx::{Executor, SqliteConnection, SqlitePool, Row};
+use serde::{Deserialize, Serialize};
+use sqlx::{Executor, Row, SqliteConnection, SqlitePool};
 use std::{
     fs::{self, File},
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Weak},
+    sync::{atomic::AtomicBool, mpsc::channel, Arc, Weak},
     time::Duration,
 };
+use time::OffsetDateTime;
 
-use data_encoding::BASE64URL;
+use data_encoding::{BASE64URL, HEXUPPER};
 use tokio::{
     fs::create_dir,
     io::{AsyncReadExt, AsyncWriteExt},
     select,
+    sync::oneshot,
 };
 use tracing::{debug, error, error_span, field::debug, info, info_span, warn, Instrument};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
@@ -27,13 +31,13 @@ use wtransport::{
 mod auth;
 mod certs;
 mod files;
-mod messages;
+mod signals;
 
-use messages::{FetchResponse, Signal, SignalRequest};
+use signals::{FetchRequest, FetchResponse, Signal};
 
 use crate::{
     files::FileManager,
-    messages::{send_response, ErrorResponse},
+    signals::{send_response, ErrorResponse},
 };
 
 // TODO: DB eats up more space than it seemingly needs. maybe switch to sqlite3?
@@ -58,25 +62,21 @@ async fn main() -> Result<()> {
     let internal_root = build_root_folder(INTERNAL_FOLDER)?;
     let upload_root = build_internal_folder(&internal_root, INTERNAL_UPLOADED_FILES)?;
     let cert_root = build_internal_folder(&internal_root, INTERNAL_CERTS)?;
-    let fs_root = build_root_folder(FILES_FOLDER)?;
+    let files_root = build_root_folder(FILES_FOLDER)?;
 
-    let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&fs_root, false)?;
-    let (_upld_watcher, upld_rx) = FileManager::new_fs_notify(&upload_root, false)?;
+    let (_fs_watcher, fs_rx) = FileManager::new_fs_notify(&files_root, false)?;
 
     let mut db_path = internal_root;
     db_path.push("databseV1.db");
     info!("{}", db_path.to_string_lossy());
     let db = init_db(db_path).await?;
 
-    let fs_manager = FileManager::new(fs_root, db.clone(), fs_rx).await?;
+    let fs_manager = FileManager::new(files_root, db.clone(), fs_rx).await?;
+    let (auth_manager, reservation_chan) = ReservationAuthority::new(db.clone()).await?;
 
-    // let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
+    // TODO: put in select so errors get caught
+    tokio::spawn(auth_manager.start());
 
-    // identity.private_key().store_secret_pemfile(filepath);
-
-    // self signed so our certhash should be the only one
-    // let cert = &identity.certificate_chain().as_ref()[0];
-    // info!(certhash = BASE64URL.encode(cert.hash().as_ref()),);
 
     let start_config = ActiveServerConfig {
         port: 4999,
@@ -331,13 +331,33 @@ async fn signaling_stream(
     accept_put.store(true, std::sync::atomic::Ordering::Relaxed);
 
     match decoded {
-        Ok(Signal::Fetch(request)) => {
+        Ok(signal) => rcv_signal(signal, connection, db_ref, stream).await?,
+        Err(e) => {
+            info!("client sent garbled request {:?}", e);
+            send_response(&mut stream.0, ErrorResponse { status: 400 }).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn rcv_signal(
+    signal: Signal,
+    connection: &Connection,
+    db_ref: SqlitePool,
+    mut stream: (SendStream, RecvStream),
+) -> Result<()> {
+    match signal {
+        Signal::Fetch(request) => {
             info!("Received (bi) request from client");
 
             // search db for requested file hash
             let q = format!("SELECT * FROM {FILE_TABLE} WHERE Hash = $1");
             let q = sqlx::query(&q).bind(BASE64URL.encode(&request.hash));
-            let record: Option<(String, i64)> = db_ref.fetch_optional(q).await?.map(|row| (row.get(1), row.get(2)));
+            let record: Option<(String, i64)> = db_ref
+                .fetch_optional(q)
+                .await?
+                .map(|row| (row.get(1), row.get(2)));
 
             match record {
                 Some(record) => {
@@ -389,10 +409,9 @@ async fn signaling_stream(
                 }
             };
         }
-        Err(e) => {
-            info!("client sent garbled request {:?}", e);
-            send_response(&mut stream.0, ErrorResponse { status: 400 }).await?;
-        }
+        Signal::Put(put) => {
+            todo!();
+        },
     }
 
     Ok(())
@@ -450,10 +469,10 @@ fn touch_dir(path: &Path) {
 }
 
 async fn init_db(path: impl AsRef<Path>) -> anyhow::Result<SqlitePool> {
-    let path = path.as_ref();
-    use sqlx::prelude::*;
     use sqlx::sqlite::*;
-    // create or do nothing
+
+    let path = path.as_ref();
+    // create and do nothing
     let c = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::default())?;
     c.close().map_err(|(_, e)| e)?;
     let conn = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path)).await?;
@@ -463,12 +482,12 @@ async fn init_db(path: impl AsRef<Path>) -> anyhow::Result<SqlitePool> {
 #[test]
 fn rust_js_cbor() -> Result<()> {
     use data_encoding::{BASE64, HEXUPPER};
-    use messages::SignalRequest;
+    use signals::FetchRequest;
 
     let js_cbor_encoded = "uQABZGhhc2hYIJZms3GYoG16Z8x/2Z/3WM+6CR+R7RZSCiRdYN1QSpDe";
     let js_cbor = BASE64.decode(js_cbor_encoded.as_bytes())?;
 
-    let rust_cbor = SignalRequest {
+    let rust_cbor = FetchRequest {
         hash: BASE64URL
             .decode("cbonmWDP8UdIQ0Ff0XGPwNZlGNiH-l54Gx1nvPLvUl0=".as_bytes())?
             .try_into()
@@ -484,4 +503,26 @@ fn rust_js_cbor() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+// nice so cbor4ii serilizes as a fixed arry
+fn cbor_tuple() {
+    use serde_repr::{Deserialize_repr, Serialize_repr};
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Foo {
+        value: u64,
+    }
+    #[derive(Debug, Serialize_repr, Deserialize_repr)]
+    #[repr(u16)]
+    enum Ver {
+        V0 = 0,
+        V1 = 1,
+    }
+
+    let a = (Ver::V0, Foo { value: 1234 });
+    let v = Vec::new();
+    let s = HEXUPPER.encode(&cbor4ii::serde::to_vec(v, &a).unwrap());
+
+    println!("{s}")
 }

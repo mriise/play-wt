@@ -83,7 +83,7 @@ impl RollingCert {
     /// serialize to [2 bytes week index, 32 bytes hash of cert]
     fn serialize(&self) -> Vec<u8> {
         let index_b = self.week_index.0.to_le_bytes();
-        // all rolling certs for this server are self signed, we only need the frist
+        // all rolling certs for (this server are self signed, we only need the frist)
         let cert = &self.identity.certificate_chain().as_ref()[0];
         let cert_b = *cert.hash().as_ref();
         [index_b.as_slice(), cert_b.as_slice()].concat()

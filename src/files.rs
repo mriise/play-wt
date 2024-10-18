@@ -214,7 +214,10 @@ impl FileManager {
             return Ok(None);
         }
 
-        let hash = blake3::hash(&std::fs::read(&path)?);
+        let hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_mmap_rayon(&path)?.finalize()
+        };
 
         let name = path_to_filename(path)?;
 
